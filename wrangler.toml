@@ -1,0 +1,61 @@
+name = "agent-fleet"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[kv_namespaces]]
+binding = "AGENT_CONFIG"
+id = "b795557a60614036bc21b9997b3598aa"
+
+[[durable_objects.bindings]]
+name = "AGENT_MEMORY"
+class_name = "AgentMemory"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentMemory"]
+
+[[vectorize]]
+binding = "AGENT_VECTORS"
+index_name = "agent-memory"
+
+[triggers]
+crons = [
+  "0 21 * * SUN",      # Blog draft: Sunday 7am AEST
+  "0 0 * * MON",       # Weekly product digest: Monday 10am AEST
+  "0 1 * * TUE",       # LinkedIn post: Tuesday 11am AEST
+  "0 0 * * *",         # Daily competitor scan + publish approved posts
+  "0 22 1 * *"         # Monthly investor update: 1st of month 8am AEST
+]
+
+[vars]
+PRODUCT_ID = "askarthur"
+BUDGET_LIMIT_USD = "150"
+WEB_SEARCH_CAP = "150"
+GHOST_API_URL = "https://blog.askarthur.au"
+
+# Secrets — set via: wrangler secret put <name>
+# ANTHROPIC_API_KEY
+# GHOST_ADMIN_API_KEY
+# TWITTER_API_KEY
+# TWITTER_API_SECRET
+# TWITTER_ACCESS_TOKEN
+# TWITTER_ACCESS_SECRET
+# LINKEDIN_ACCESS_TOKEN
+# MAILGUN_API_KEY
+# MAILGUN_DOMAIN
+# GMAIL_OAUTH_TOKEN
+# GCAL_OAUTH_TOKEN
+# NOTION_TOKEN
+# NOTION_DB_BLOG
+# NOTION_DB_SOCIAL
+# NOTION_DB_INVESTOR
+# NOTION_DB_COMPETITOR
+# NOTION_DB_DIGESTS
+# FOUNDER_EMAIL
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_ALLOWED_IDS
+# TELEGRAM_WEBHOOK_SECRET
+# GITHUB_PAT
+# DEPLOY_HOOK_URL
+# GH_REPO
