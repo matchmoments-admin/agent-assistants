@@ -133,7 +133,13 @@ async function saveToNotion(
   const dbId = dbMap[input.database as string];
   if (!dbId) return `Error: Unknown database "${input.database}"`;
 
-  const extraProps = (input.properties as Record<string, unknown>) ?? {};
+  const rawExtraProps = (input.properties as Record<string, unknown>) ?? {};
+  // Drop `Name` from extraProps — we always write our own Name (the title).
+  // If the agent sends {Name: ...} in properties, its shape is usually wrong
+  // and would override ours, producing validation_error from Notion.
+  const extraProps = Object.fromEntries(
+    Object.entries(rawExtraProps).filter(([k]) => k !== 'Name'),
+  );
 
   // Always write Name (Notion requires a title). Status/Product are optional —
   // include them only if the target DB has those columns (pass via extraProps).
@@ -141,10 +147,10 @@ async function saveToNotion(
   const body = {
     parent: { database_id: dbId },
     properties: {
+      ...extraProps,
       Name: {
         title: [{ text: { content: input.title as string } }],
       },
-      ...extraProps,
     },
     children: splitToBlocks(input.content as string),
   };

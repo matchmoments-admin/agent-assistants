@@ -47,18 +47,21 @@ export async function runAgentSession(
   const sessionId = await startSession(env, agentId, environmentId, taskTitle, vaultIds);
   console.log(`[${agentName}] session.start id=${sessionId} agent=${agentId}`);
 
+  let watchdogHandle: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      runSessionLoop(env, config, agentName, sessionId, prompt),
-      new Promise<never>((_, reject) =>
-        setTimeout(
+      runSessionLoop(env, config, agentName, sessionId, prompt).finally(() => {
+        if (watchdogHandle) clearTimeout(watchdogHandle);
+      }),
+      new Promise<never>((_, reject) => {
+        watchdogHandle = setTimeout(
           () => reject(Object.assign(
             new Error(`Session ${sessionId} exceeded ${SESSION_TIMEOUT_MS}ms watchdog`),
             { sessionId },
           )),
           SESSION_TIMEOUT_MS,
-        ),
-      ),
+        );
+      }),
     ]);
     await trackCostFromSession(env, sessionId);
     console.log(`[${agentName}] session.done id=${sessionId}`);
