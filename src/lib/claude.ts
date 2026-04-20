@@ -31,6 +31,16 @@ export interface Env {
   DEPLOY_HOOK_URL: string;
   GH_REPO: string;
   DEBUG_AGENT_API?: string;
+  AGENT_TASKS: Queue<AgentTaskMessage>;
+}
+
+export interface AgentTaskMessage {
+  kind: 'agent-command' | 'feature';
+  chatId: number;
+  userId: number;
+  agent?: 'cmo' | 'cpo' | 'growth' | 'ir';
+  task?: string;
+  description?: string;
 }
 
 const BASE = 'https://api.anthropic.com';

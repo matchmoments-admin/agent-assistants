@@ -22,6 +22,16 @@ new_sqlite_classes = ["AgentMemory"]
 binding = "AGENT_VECTORS"
 index_name = "agent-memory"
 
+[[queues.producers]]
+queue = "agent-tasks"
+binding = "AGENT_TASKS"
+
+[[queues.consumers]]
+queue = "agent-tasks"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 2
+
 [triggers]
 crons = [
   "0 21 * * SUN",      # Blog draft: Sunday 7am AEST

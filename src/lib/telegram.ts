@@ -251,21 +251,15 @@ export async function handleTelegramWebhook(
   const cmd = AGENT_COMMANDS[command];
   if (cmd) {
     await sendTelegram(env, message.chat.id, `Running ${cmd.agent}/${cmd.task}...`);
-    ctx.waitUntil((async () => {
-      try {
-        await checkBudgetOrAbort(env, config);
-        switch (cmd.agent) {
-          case 'cmo': await runCMOAgent(env, config, cmd.task); break;
-          case 'cpo': await runCPOAgent(env, config, cmd.task); break;
-          case 'growth': await runGrowthAgent(env, config, cmd.task); break;
-          case 'ir': await runIRAgent(env, config, cmd.task); break;
-        }
-        await sendTelegram(env, message.chat.id, 'Done. Check Notion for results.');
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : 'Unknown error';
-        await sendTelegram(env, message.chat.id, `Error: ${errMsg}`);
-      }
-    })());
+    // Queue the agent run so it executes in a separate invocation untied to
+    // Telegram's 60s webhook timeout. Queue consumer in index.ts picks it up.
+    await env.AGENT_TASKS.send({
+      kind: 'agent-command',
+      chatId: message.chat.id,
+      userId: message.from.id,
+      agent: cmd.agent as 'cmo' | 'cpo' | 'growth' | 'ir',
+      task: cmd.task,
+    });
     return new Response('OK', { status: 200 });
   }
 
@@ -325,15 +319,12 @@ async function handleCallbackQuery(
     await editMessage(env, chatId, messageId,
       `\uD83E\uDD16 Code agent working on:\n<i>${description}</i>\n\nThis may take 1-3 minutes. The agent will message you when the PR is ready.`);
 
-    ctx.waitUntil((async () => {
-      try {
-        await checkBudgetOrAbort(env, config);
-        await runCodeAgent(env, config, description);
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : 'Unknown error';
-        await sendTelegram(env, chatId, `\u274C Code agent error: ${errMsg}`);
-      }
-    })());
+    await env.AGENT_TASKS.send({
+      kind: 'feature',
+      chatId,
+      userId: query.from.id,
+      description,
+    });
     return new Response('OK', { status: 200 });
   }
 
@@ -405,7 +396,7 @@ function isAllowed(env: Env, userId: number): boolean {
   return env.TELEGRAM_ALLOWED_IDS.split(',').map(id => parseInt(id.trim(), 10)).includes(userId);
 }
 
-async function sendTelegram(env: Env, chatId: number, text: string): Promise<void> {
+export async function sendTelegram(env: Env, chatId: number, text: string): Promise<void> {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

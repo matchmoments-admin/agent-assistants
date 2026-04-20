@@ -1,5 +1,5 @@
 import { AgentMemory } from './memory';
-import type { Env } from './lib/claude';
+import type { Env, AgentTaskMessage } from './lib/claude';
 import { loadBrandConfig } from './config/loader';
 import { checkBudgetOrAbort } from './lib/cost-control';
 import { bootstrap } from './bootstrap';
@@ -8,7 +8,7 @@ import { runCMOAgent } from './agents/cmo';
 import { runGrowthAgent } from './agents/growth';
 import { runIRAgent } from './agents/investor-relations';
 import { runCodeAgent } from './agents/code';
-import { handleTelegramWebhook } from './lib/telegram';
+import { handleTelegramWebhook, sendTelegram } from './lib/telegram';
 
 export { AgentMemory };
 
@@ -112,5 +112,32 @@ export default {
     }
 
     return new Response(`${env.PRODUCT_ID} agent fleet — operational`, { status: 200 });
+  },
+
+  async queue(batch: MessageBatch<AgentTaskMessage>, env: Env): Promise<void> {
+    const config = loadBrandConfig(env);
+    for (const msg of batch.messages) {
+      const m = msg.body;
+      try {
+        await checkBudgetOrAbort(env, config);
+        if (m.kind === 'agent-command' && m.agent && m.task) {
+          switch (m.agent) {
+            case 'cmo': await runCMOAgent(env, config, m.task); break;
+            case 'cpo': await runCPOAgent(env, config, m.task); break;
+            case 'growth': await runGrowthAgent(env, config, m.task); break;
+            case 'ir': await runIRAgent(env, config, m.task); break;
+          }
+          await sendTelegram(env, m.chatId, 'Done. Check Notion for results.');
+        } else if (m.kind === 'feature' && m.description) {
+          await runCodeAgent(env, config, m.description);
+          // Code agent calls notify_founder itself with the PR URL
+        }
+        msg.ack();
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : 'Unknown error';
+        await sendTelegram(env, m.chatId, `Error: ${errMsg}`).catch(() => {});
+        msg.ack(); // don't retry on logical errors; budget / schema issues will repro
+      }
+    }
   },
 };
