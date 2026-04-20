@@ -30,6 +30,7 @@ export interface Env {
   GITHUB_PAT: string;
   DEPLOY_HOOK_URL: string;
   GH_REPO: string;
+  DEBUG_AGENT_API?: string;
 }
 
 const BASE = 'https://api.anthropic.com';
@@ -61,7 +62,10 @@ export async function ensureEnvironment(env: Env): Promise<string> {
       config: { type: 'cloud', networking: { type: 'unrestricted' } },
     }),
   });
-  if (!res.ok) throw new Error(`Create environment failed: ${await res.text()}`);
+  if (!res.ok) {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Create environment failed [req ${rid}]: ${await res.text()}`);
+  }
   const data = await res.json() as { id: string };
   await kv.put(env, 'environment_id', data.id);
   return data.id;
@@ -75,15 +79,34 @@ export async function createVault(
   const cached = await kv.get(env, `vault_${name}`);
   if (cached) return cached;
 
-  const res = await fetch(`${BASE}/v1/vaults`, {
+  const createRes = await fetch(`${BASE}/v1/vaults`, {
     method: 'POST',
     headers: headers(env),
-    body: JSON.stringify({ secrets }),
+    body: JSON.stringify({ display_name: name }),
   });
-  if (!res.ok) throw new Error(`Create vault failed: ${await res.text()}`);
-  const data = await res.json() as { id: string };
-  await kv.put(env, `vault_${name}`, data.id);
-  return data.id;
+  if (!createRes.ok) {
+    const rid = createRes.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Create vault failed [req ${rid}]: ${await createRes.text()}`);
+  }
+  const { id: vaultId } = await createRes.json() as { id: string };
+
+  for (const [key, value] of Object.entries(secrets)) {
+    const credRes = await fetch(`${BASE}/v1/vaults/${vaultId}/credentials`, {
+      method: 'POST',
+      headers: headers(env),
+      body: JSON.stringify({
+        display_name: key,
+        auth: { type: 'static_bearer', token: value },
+      }),
+    });
+    if (!credRes.ok) {
+      const rid = credRes.headers.get('request-id') ?? 'unknown';
+      throw new Error(`Add credential "${key}" failed [req ${rid}]: ${await credRes.text()}`);
+    }
+  }
+
+  await kv.put(env, `vault_${name}`, vaultId);
+  return vaultId;
 }
 
 export async function createAgent(
@@ -107,7 +130,10 @@ export async function createAgent(
       mcp_servers: [...mcpServers],
     }),
   });
-  if (!res.ok) throw new Error(`Create agent failed: ${await res.text()}`);
+  if (!res.ok) {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Create agent failed [req ${rid}]: ${await res.text()}`);
+  }
   const data = await res.json() as { id: string };
   return data.id;
 }
@@ -123,13 +149,16 @@ export async function startSession(
     method: 'POST',
     headers: headers(env),
     body: JSON.stringify({
-      agent: agentId,
+      agent: { type: 'agent', id: agentId },
       environment_id: environmentId,
       title,
       vault_ids: vaultIds,
     }),
   });
-  if (!res.ok) throw new Error(`Start session failed: ${await res.text()}`);
+  if (!res.ok) {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Start session failed [req ${rid}]: ${await res.text()}`);
+  }
   const data = await res.json() as { id: string };
   return data.id;
 }
@@ -146,7 +175,14 @@ export async function sendPrompt(
       events: [{ type: 'user.message', content: [{ type: 'text', text }] }],
     }),
   });
-  if (!res.ok) throw new Error(`Send prompt failed: ${await res.text()}`);
+  if (env.DEBUG_AGENT_API === '1') {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    console.log(`[debug] sendPrompt status=${res.status} req=${rid} body=${await res.clone().text()}`);
+  }
+  if (!res.ok) {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Send prompt failed [req ${rid}]: ${await res.text()}`);
+  }
 }
 
 export async function sendToolResult(
@@ -166,7 +202,21 @@ export async function sendToolResult(
       }],
     }),
   });
-  if (!res.ok) throw new Error(`Send tool result failed: ${await res.text()}`);
+  if (env.DEBUG_AGENT_API === '1') {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    console.log(`[debug] sendToolResult status=${res.status} req=${rid} body=${await res.clone().text()}`);
+  }
+  if (!res.ok) {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Send tool result failed [req ${rid}]: ${await res.text()}`);
+  }
+}
+
+export async function archiveSession(env: Env, sessionId: string): Promise<void> {
+  await fetch(`${BASE}/v1/sessions/${sessionId}/archive`, {
+    method: 'POST',
+    headers: headers(env),
+  });
 }
 
 export interface SSEEvent {
@@ -180,13 +230,16 @@ export async function streamSession(
   sessionId: string,
   onEvent: (event: SSEEvent) => Promise<void>,
 ): Promise<void> {
-  const res = await fetch(`${BASE}/v1/sessions/${sessionId}/stream`, {
+  const res = await fetch(`${BASE}/v1/sessions/${sessionId}/events/stream`, {
     headers: {
       ...headers(env),
       Accept: 'text/event-stream',
     },
   });
-  if (!res.ok) throw new Error(`Stream failed: ${await res.text()}`);
+  if (!res.ok) {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Stream failed [req ${rid}]: ${await res.text()}`);
+  }
   if (!res.body) throw new Error('No response body for stream');
 
   const reader = res.body.getReader();

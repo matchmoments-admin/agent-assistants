@@ -32,7 +32,10 @@ export async function uploadSkill(
     body: formData,
   });
 
-  if (!res.ok) throw new Error(`Upload skill failed: ${await res.text()}`);
+  if (!res.ok) {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Upload skill failed [req ${rid}]: ${await res.text()}`);
+  }
   const data = await res.json() as { id: string };
   await kv.put(env, `skill_id:${skillName}`, data.id);
   return data.id;

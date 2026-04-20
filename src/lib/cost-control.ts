@@ -36,21 +36,30 @@ export async function trackCostFromSession(env: Env, sessionId: string): Promise
         'anthropic-beta': 'managed-agents-2026-04-01',
       },
     });
+    if (!res.ok) {
+      const rid = res.headers.get('request-id') ?? 'unknown';
+      console.warn(`trackCostFromSession: status=${res.status} req=${rid}`);
+      return;
+    }
     const session = await res.json() as {
       usage?: {
         input_tokens: number;
         output_tokens: number;
+        cache_creation_input_tokens?: number;
         cache_read_input_tokens?: number;
       };
     };
     if (!session.usage) return;
 
-    const { input_tokens, output_tokens, cache_read_input_tokens } = session.usage;
-    const freshInput = input_tokens - (cache_read_input_tokens ?? 0);
-    // Sonnet 4.6 rates as default estimate
+    const { input_tokens, output_tokens } = session.usage;
+    const cacheWrite = session.usage.cache_creation_input_tokens ?? 0;
+    const cacheRead = session.usage.cache_read_input_tokens ?? 0;
+    const freshInput = input_tokens - cacheWrite - cacheRead;
+    // Sonnet 4.6 rates: base $3/M, cache write $3.75/M, cache read $0.30/M, output $15/M
     const cost =
       (freshInput * 3 / 1_000_000) +
-      ((cache_read_input_tokens ?? 0) * 0.3 / 1_000_000) +
+      (cacheWrite * 3.75 / 1_000_000) +
+      (cacheRead * 0.3 / 1_000_000) +
       (output_tokens * 15 / 1_000_000);
 
     const current = parseFloat(await kv.get(env, 'monthly_spend_usd') ?? '0');
