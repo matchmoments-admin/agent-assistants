@@ -1,5 +1,14 @@
 import type { Env, SSEEvent } from './claude';
-import { kv, startSession, sendPrompt, sendToolResult, openStream, readStreamEvents, archiveSession } from './claude';
+import {
+  kv,
+  startSession,
+  sendPrompt,
+  sendToolResult,
+  openStream,
+  readStreamEvents,
+  archiveSession,
+  listSessionEvents,
+} from './claude';
 import { trackCostFromSession } from './cost-control';
 import { executeCustomTool } from './tools';
 import type { BrandConfig } from '../config/types';
@@ -11,7 +20,13 @@ interface PendingToolCall {
 }
 
 const MAX_TURNS = 30;
+const MAX_STREAM_RETRIES = 3;
 const SESSION_TIMEOUT_MS = 10 * 60 * 1000;
+
+function isNetworkDrop(err: unknown): boolean {
+  const msg = String(err ?? '');
+  return /network connection lost|connection reset|stream closed|fetch failed|socket hang up/i.test(msg);
+}
 
 export async function runAgentSession(
   env: Env,
@@ -30,18 +45,29 @@ export async function runAgentSession(
   const vaultIds = vaultId ? [vaultId] : [];
 
   const sessionId = await startSession(env, agentId, environmentId, taskTitle, vaultIds);
+  console.log(`[${agentName}] session.start id=${sessionId} agent=${agentId}`);
 
   try {
     await Promise.race([
       runSessionLoop(env, config, agentName, sessionId, prompt),
       new Promise<never>((_, reject) =>
         setTimeout(
-          () => reject(new Error(`Session ${sessionId} exceeded ${SESSION_TIMEOUT_MS}ms watchdog`)),
+          () => reject(Object.assign(
+            new Error(`Session ${sessionId} exceeded ${SESSION_TIMEOUT_MS}ms watchdog`),
+            { sessionId },
+          )),
           SESSION_TIMEOUT_MS,
         ),
       ),
     ]);
     await trackCostFromSession(env, sessionId);
+    console.log(`[${agentName}] session.done id=${sessionId}`);
+  } catch (err) {
+    console.error(`[${agentName}] session.fail id=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
+    if (err instanceof Error && !('sessionId' in err)) {
+      Object.assign(err, { sessionId });
+    }
+    throw err;
   } finally {
     await archiveSession(env, sessionId).catch(() => { /* best effort */ });
   }
@@ -63,31 +89,24 @@ async function runSessionLoop(
   let turns = 0;
   let firstTurn = true;
   let queuedToolResults: ToolResultPayload[] = [];
+  const seenEventIds = new Set<string>();
 
   while (!done) {
     if (++turns > MAX_TURNS) {
       throw new Error(`Session ${sessionId} exceeded MAX_TURNS (${MAX_TURNS})`);
     }
 
-    // Open the SSE stream BEFORE posting any input so we never miss early events.
-    const reader = await openStream(env, sessionId);
-
-    if (firstTurn) {
-      await sendPrompt(env, sessionId, prompt);
-      firstTurn = false;
-    } else {
-      for (const { toolId, result } of queuedToolResults) {
-        await sendToolResult(env, sessionId, toolId, result);
-      }
-      queuedToolResults = [];
-    }
-
     const pendingTools: PendingToolCall[] = [];
     let stopReasonType = '';
 
-    await readStreamEvents(reader, async (event: SSEEvent) => {
+    const handleEvent = async (event: SSEEvent) => {
+      if (typeof event.id === 'string') {
+        if (seenEventIds.has(event.id)) return;
+        seenEventIds.add(event.id);
+      }
       switch (event.type) {
         case 'agent.custom_tool_use': {
+          console.log(`[${agentName}] tool.call name=${event.name} id=${event.id}`);
           pendingTools.push({
             id: event.id as string,
             name: event.name as string,
@@ -108,17 +127,62 @@ async function runSessionLoop(
         }
         case 'session.status_idle': {
           stopReasonType = event.stop_reason?.type as string ?? 'end_turn';
+          console.log(`[${agentName}] idle turn=${turns} stop_reason=${stopReasonType}`);
           break;
         }
         case 'agent.message': {
-          console.log(`[${agentName}] ${event.content ?? ''}`);
+          console.log(`[${agentName}] message turn=${turns}`);
           break;
         }
         default: {
           console.debug(`[${agentName}] unhandled event type=${event.type}`);
         }
       }
-    });
+    };
+
+    // Open the SSE stream BEFORE sending any input.
+    // Retry on Cloudflare network drops — the server keeps the session state;
+    // we dedupe events by id and catch up via listSessionEvents on each retry.
+    let streamAttempts = 0;
+    let streamDone = false;
+    while (!streamDone) {
+      streamAttempts++;
+      console.log(`[${agentName}] stream.open turn=${turns} attempt=${streamAttempts}`);
+      try {
+        const reader = await openStream(env, sessionId);
+
+        if (streamAttempts === 1) {
+          if (firstTurn) {
+            await sendPrompt(env, sessionId, prompt);
+            firstTurn = false;
+          } else {
+            for (const { toolId, result } of queuedToolResults) {
+              console.log(`[${agentName}] tool.result id=${toolId}`);
+              await sendToolResult(env, sessionId, toolId, result);
+            }
+            queuedToolResults = [];
+          }
+        } else {
+          // Reconnect path — catch up any events we missed while disconnected
+          console.log(`[${agentName}] stream.catchup listing events since drop`);
+          const missed = await listSessionEvents(env, sessionId);
+          for (const ev of missed) {
+            await handleEvent(ev);
+            if (stopReasonType) break;
+          }
+          if (stopReasonType) { streamDone = true; break; }
+        }
+
+        await readStreamEvents(reader, handleEvent);
+        streamDone = true;
+      } catch (err) {
+        if (isNetworkDrop(err) && streamAttempts < MAX_STREAM_RETRIES) {
+          console.warn(`[${agentName}] stream.drop attempt=${streamAttempts} err=${err instanceof Error ? err.message : String(err)} — reconnecting`);
+          continue;
+        }
+        throw err;
+      }
+    }
 
     if (stopReasonType === 'requires_action') {
       if (pendingTools.length === 0) {

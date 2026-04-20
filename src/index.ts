@@ -118,6 +118,8 @@ export default {
     const config = loadBrandConfig(env);
     for (const msg of batch.messages) {
       const m = msg.body;
+      const label = m.kind === 'agent-command' ? `${m.agent}/${m.task}` : m.kind;
+      console.log(`queue.start kind=${m.kind} label=${label} chat=${m.chatId}`);
       try {
         await checkBudgetOrAbort(env, config);
         if (m.kind === 'agent-command' && m.agent && m.task) {
@@ -132,10 +134,16 @@ export default {
           await runCodeAgent(env, config, m.description);
           // Code agent calls notify_founder itself with the PR URL
         }
+        console.log(`queue.done label=${label}`);
         msg.ack();
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : 'Unknown error';
-        await sendTelegram(env, m.chatId, `Error: ${errMsg}`).catch(() => {});
+        const sessionId = (err as { sessionId?: string })?.sessionId;
+        const telegramMsg = sessionId
+          ? `Error in ${label} (session ${sessionId}): ${errMsg}`
+          : `Error in ${label}: ${errMsg}`;
+        console.error(`queue.fail label=${label} session=${sessionId ?? 'n/a'} err=${errMsg}`);
+        await sendTelegram(env, m.chatId, telegramMsg).catch(() => {});
         msg.ack(); // don't retry on logical errors; budget / schema issues will repro
       }
     }

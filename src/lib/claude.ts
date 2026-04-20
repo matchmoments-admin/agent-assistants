@@ -222,6 +222,22 @@ export async function sendToolResult(
   }
 }
 
+export async function listSessionEvents(
+  env: Env,
+  sessionId: string,
+  limit: number = 100,
+): Promise<SSEEvent[]> {
+  const res = await fetch(`${BASE}/v1/sessions/${sessionId}/events?limit=${limit}`, {
+    headers: headers(env),
+  });
+  if (!res.ok) {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    throw new Error(`List events failed [req ${rid}]: ${await res.text()}`);
+  }
+  const body = await res.json() as { events?: SSEEvent[]; data?: SSEEvent[] };
+  return body.events ?? body.data ?? [];
+}
+
 export async function archiveSession(env: Env, sessionId: string): Promise<void> {
   await fetch(`${BASE}/v1/sessions/${sessionId}/archive`, {
     method: 'POST',
