@@ -135,29 +135,28 @@ async function saveToNotion(
 
   const extraProps = (input.properties as Record<string, unknown>) ?? {};
 
+  // Always write Name (Notion requires a title). Status/Product are optional —
+  // include them only if the target DB has those columns (pass via extraProps).
+  // The /publish workflow needs a Status column with values Draft/Approved.
+  const body = {
+    parent: { database_id: dbId },
+    properties: {
+      Name: {
+        title: [{ text: { content: input.title as string } }],
+      },
+      ...extraProps,
+    },
+    children: splitToBlocks(input.content as string),
+  };
+
   const res = await fetch('https://api.notion.com/v1/pages', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${env.NOTION_TOKEN}`,
       'Content-Type': 'application/json',
-      'Notion-Version': '2025-09-03',
+      'Notion-Version': '2022-06-28',
     },
-    body: JSON.stringify({
-      parent: { database_id: dbId },
-      properties: {
-        Name: {
-          title: [{ text: { content: input.title as string } }],
-        },
-        Status: {
-          select: { name: 'Draft' },
-        },
-        Product: {
-          select: { name: config.productName },
-        },
-        ...extraProps,
-      },
-      children: splitToBlocks(input.content as string),
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) return `Notion error: ${await res.text()}`;
@@ -204,7 +203,7 @@ async function updateNotionStatus(
     headers: {
       'Authorization': `Bearer ${env.NOTION_TOKEN}`,
       'Content-Type': 'application/json',
-      'Notion-Version': '2025-09-03',
+      'Notion-Version': '2022-06-28',
     },
     body: JSON.stringify({ properties: props }),
   });
@@ -220,7 +219,7 @@ export async function queryNotionByStatus(
     headers: {
       'Authorization': `Bearer ${env.NOTION_TOKEN}`,
       'Content-Type': 'application/json',
-      'Notion-Version': '2025-09-03',
+      'Notion-Version': '2022-06-28',
     },
     body: JSON.stringify({
       filter: { property: 'Status', select: { equals: status } },
