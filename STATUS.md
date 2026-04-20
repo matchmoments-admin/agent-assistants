@@ -2,7 +2,69 @@
 
 > Living document. Update this as setup progresses.
 
-Last updated: 2026-04-19
+Last updated: 2026-04-20
+
+## Schema migration — 2026-04-20
+
+Managed Agents beta schema churned between its 2026-04-08 launch and today. Fleet went production-down — every Telegram command and cron failed at `POST /v1/sessions` or the first event send. Two rounds of migration were needed because the `managed-agents-2026-04-01` header surfaces a *different* validator state than the old `agent-api-2026-03-01` header; guesses based on pre-migration error responses were stale by the time we deployed.
+
+Final confirmed wire shape (all verified 200 via `scripts/contract-test.mjs`):
+
+- Beta header: `managed-agents-2026-04-01` (across `claude.ts`, `cost-control.ts`, `skills.ts`; `skills-2025-10-02` token preserved alongside)
+- Session create body: `{ agent: { type: 'agent', id }, environment_id: <string>, title, vault_ids }` (NOT `agent_reference`, NOT bare string, NOT `environment`)
+- User event: `{ type: 'user.message', content: [...] }` — the `user.*` prefix is kept
+- Tool result event: `{ type: 'user.custom_tool_result', custom_tool_use_id, content: [...] }` — prefix + field name both kept
+- Session IDs have prefix `sesn_`, not `sess_`
+- Archive endpoint: `POST /v1/sessions/{id}/archive` returns 200
+
+Also landed alongside:
+
+- `request-id` response header now threaded into every Anthropic-call error (9 sites across `claude.ts`, `cost-control.ts`, `skills.ts`)
+- Optional `DEBUG_AGENT_API=1` secret — raw response + request-id logging in `sendPrompt`/`sendToolResult`. Currently enabled. Remove in a follow-up once confidence stabilises.
+- `scripts/contract-test.mjs` — **run before every deploy**: `node scripts/contract-test.mjs`. Fails fast on any future schema drift.
+- `src/lib/session-runner.ts` — `MAX_TURNS = 30` cap, 10-min wall-clock watchdog, `try/finally` with `archiveSession` to stop idle sessions from billing.
+- `src/lib/telegram.ts` — webhook secret compared with constant-time helper (was `!==`, timing-unsafe), `update_id` deduped via KV with 24h TTL to absorb Telegram's retry behaviour.
+- `CLAUDE.md` implementation-details paragraph rewritten to match the confirmed shape.
+
+**Verification checklist:**
+- [x] `scripts/contract-test.mjs` — all 4 checks pass against live API
+- [ ] `/tweet test` via Telegram — 200 on session create + first event, draft arrives in Notion
+- [ ] `/blog <topic>` — exercises `sendToolResult` end-to-end
+- [ ] `/status` — `trackCostFromSession` OK
+- [ ] `/feature add test readme` — Code agent full tool loop + GitHub PR
+- [ ] After all four pass: `npx wrangler secret delete DEBUG_AGENT_API` + strip debug-echo log lines in `claude.ts` + remove `DEBUG_AGENT_API?: string` from `Env`
+
+## Outstanding audit follow-ups
+
+Pulled from the 2026-04-20 fix-it brief. What landed in the migration above is checked off; remaining work prioritised for future sprints.
+
+### P1 — next sprint
+
+- [x] ~~**Contract test** — script that creates a session + sends an event and asserts 200~~ — **done**: `scripts/contract-test.mjs`. Still TODO: wire into CI as a nightly gate.
+- [x] ~~**Telegram webhook secret verification** (constant-time)~~ — **done**: `src/lib/telegram.ts` `constantTimeEqual`.
+- [x] ~~**Update dedup**~~ — **done**: KV `tg_update:{update_id}` with 24h TTL.
+- [x] ~~**Allowlist by user_id**~~ — already correct in existing code (`isAllowed(env, message.from.id)` uses numeric IDs).
+- **SDK migration** — `@anthropic-ai/sdk` v0.90.0 has `client.beta.sessions.*` with the correct beta header and agent shape, but its event-type params still use the `user.*` prefix (which the current server *requires*, so good). The main blocker is time, not drift: migrating now would delete ~150 lines of hand-rolled fetch and give us typed responses + automatic request-id plumbing. Revisit when bandwidth allows.
+- **CI-wired contract test** — run `scripts/contract-test.mjs` nightly via GitHub Actions on a dev workspace; fail on drift.
+
+### P2 — security hardening
+
+- [x] ~~**`max_turns` + wall-clock watchdog + session cleanup**~~ — **done** in `src/lib/session-runner.ts` (30 turns, 10-min watchdog, try/finally archive).
+- **GitHub App migration** — replace `GITHUB_PAT` with a GitHub App scoped only to `ask-arthur` (`Contents: RW`, `Pull requests: RW`, `Metadata: R`). Installation-token auth rotates hourly; commits via `createCommitOnBranch` GraphQL are signed and show as Verified.
+- **Branch protection + CODEOWNERS** on `matchmoments-admin/ask-arthur` main: PR + 1 approval + Code Owners review + linear history + signed commits + no force push, no bypass. Required checks: `path-check`, `gitleaks`, `markdownlint`.
+- **Pre-PR diff validator** in the Code agent: reject changes outside `drafts/**`, reject any secret-regex match (`sk-ant-`, `ghp_`, `github_pat_`, `ghs_`, Telegram bot token).
+- **Sandbox egress allowlist** — replace `networking: { type: 'unrestricted' }` at `src/lib/claude.ts:61` with `{ type: 'limited', allowed_hosts: [...] }` once the MCP URL inventory is known.
+- **Tool-confirmation wiring** — bridge server-side `user.tool_confirmation` events to a Telegram Run/Cancel button. Today the bot auto-allows everything; write tools (git push, gh pr) should require a human tap.
+
+### P3 — ops
+
+- **Structured JSON logs** with fields `anthropic_request_id`, `session_id`, `agent_id`, `tg_chat_id`, `tg_user_id`, `command`, `duration_ms`. Alert on 4xx spikes.
+- **Workspace split** — `askarthur-dev` / `askarthur-prod` Anthropic workspaces with per-workspace API keys + spend caps. Blast radius bounded by key.
+- **Per-user rate limit** — KV sliding window, 5/5min and 30/day per `user_id`.
+- **Idempotency keys** on PR branches, derived from `(chat_id, message_id, command)` so a retry reuses the branch instead of opening a duplicate PR.
+- **Log scrubber** — regex-redact all five secret formats in both Workers logs and outbound Telegram error messages.
+
+
 
 ## Deployed infrastructure
 

@@ -8,6 +8,7 @@ import { runIRAgent } from '../agents/investor-relations';
 import { runCodeAgent } from '../agents/code';
 
 interface TelegramUpdate {
+  update_id: number;
   message?: {
     chat: { id: number };
     from?: { id: number };
@@ -19,6 +20,13 @@ interface TelegramUpdate {
     message?: { chat: { id: number }; message_id: number };
     data?: string;
   };
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 const AGENT_COMMANDS: Record<string, { agent: string; task: string; description: string }> = {
@@ -35,17 +43,27 @@ export async function handleTelegramWebhook(
   request: Request,
   env: Env,
   config: BrandConfig,
+  ctx: ExecutionContext,
 ): Promise<Response> {
-  const secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
-  if (secret !== env.TELEGRAM_WEBHOOK_SECRET) {
+  const secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token') ?? '';
+  if (!constantTimeEqual(secret, env.TELEGRAM_WEBHOOK_SECRET)) {
     return new Response('Unauthorized', { status: 403 });
   }
 
   const update = await request.json() as TelegramUpdate;
 
+  // Dedup Telegram webhook retries — update_id is unique per update and Telegram
+  // retries for up to 24h on any 5xx. KV TTL matches that window.
+  if (update.update_id != null) {
+    const dedupeKey = `tg_update:${update.update_id}`;
+    const seen = await env.AGENT_CONFIG.get(dedupeKey);
+    if (seen) return new Response('OK', { status: 200 });
+    await env.AGENT_CONFIG.put(dedupeKey, '1', { expirationTtl: 86400 });
+  }
+
   // Handle callback queries (inline keyboard button presses)
   if (update.callback_query) {
-    return handleCallbackQuery(update.callback_query, env, config);
+    return handleCallbackQuery(update.callback_query, env, config, ctx);
   }
 
   const message = update.message;
@@ -59,7 +77,8 @@ export async function handleTelegramWebhook(
   }
 
   const text = message.text.trim();
-  const [command, ...args] = text.split(' ');
+  const [commandRaw, ...args] = text.split(' ');
+  const command = commandRaw.split('@')[0];
 
   // ── Deploy commands ─────────────────────────────────────────────────
 
@@ -232,19 +251,21 @@ export async function handleTelegramWebhook(
   const cmd = AGENT_COMMANDS[command];
   if (cmd) {
     await sendTelegram(env, message.chat.id, `Running ${cmd.agent}/${cmd.task}...`);
-    try {
-      await checkBudgetOrAbort(env, config);
-      switch (cmd.agent) {
-        case 'cmo': await runCMOAgent(env, config, cmd.task); break;
-        case 'cpo': await runCPOAgent(env, config, cmd.task); break;
-        case 'growth': await runGrowthAgent(env, config, cmd.task); break;
-        case 'ir': await runIRAgent(env, config, cmd.task); break;
+    ctx.waitUntil((async () => {
+      try {
+        await checkBudgetOrAbort(env, config);
+        switch (cmd.agent) {
+          case 'cmo': await runCMOAgent(env, config, cmd.task); break;
+          case 'cpo': await runCPOAgent(env, config, cmd.task); break;
+          case 'growth': await runGrowthAgent(env, config, cmd.task); break;
+          case 'ir': await runIRAgent(env, config, cmd.task); break;
+        }
+        await sendTelegram(env, message.chat.id, 'Done. Check Notion for results.');
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : 'Unknown error';
+        await sendTelegram(env, message.chat.id, `Error: ${errMsg}`);
       }
-      await sendTelegram(env, message.chat.id, 'Done. Check Notion for results.');
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : 'Unknown error';
-      await sendTelegram(env, message.chat.id, `Error: ${errMsg}`);
-    }
+    })());
     return new Response('OK', { status: 200 });
   }
 
@@ -258,6 +279,7 @@ async function handleCallbackQuery(
   query: NonNullable<TelegramUpdate['callback_query']>,
   env: Env,
   config: BrandConfig,
+  ctx: ExecutionContext,
 ): Promise<Response> {
   if (!query.data || !query.message) {
     return new Response('OK', { status: 200 });
@@ -303,14 +325,15 @@ async function handleCallbackQuery(
     await editMessage(env, chatId, messageId,
       `\uD83E\uDD16 Code agent working on:\n<i>${description}</i>\n\nThis may take 1-3 minutes. The agent will message you when the PR is ready.`);
 
-    try {
-      await checkBudgetOrAbort(env, config);
-      await runCodeAgent(env, config, description);
-      // Code agent calls notify_founder itself with the PR URL
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : 'Unknown error';
-      await sendTelegram(env, chatId, `\u274C Code agent error: ${errMsg}`);
-    }
+    ctx.waitUntil((async () => {
+      try {
+        await checkBudgetOrAbort(env, config);
+        await runCodeAgent(env, config, description);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : 'Unknown error';
+        await sendTelegram(env, chatId, `\u274C Code agent error: ${errMsg}`);
+      }
+    })());
     return new Response('OK', { status: 200 });
   }
 

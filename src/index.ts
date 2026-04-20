@@ -44,7 +44,7 @@ export default {
     })());
   },
 
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === '/setup' && request.method === 'POST') {
@@ -95,7 +95,7 @@ export default {
 
     if (url.pathname === '/telegram' && request.method === 'POST') {
       const config = loadBrandConfig(env);
-      return handleTelegramWebhook(request, env, config);
+      return handleTelegramWebhook(request, env, config, ctx);
     }
 
     if (url.pathname === '/status') {
