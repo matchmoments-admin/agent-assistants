@@ -225,11 +225,10 @@ export interface SSEEvent {
   [key: string]: any;
 }
 
-export async function streamSession(
+export async function openStream(
   env: Env,
   sessionId: string,
-  onEvent: (event: SSEEvent) => Promise<void>,
-): Promise<void> {
+): Promise<ReadableStreamDefaultReader<Uint8Array>> {
   const res = await fetch(`${BASE}/v1/sessions/${sessionId}/events/stream`, {
     headers: {
       ...headers(env),
@@ -241,8 +240,13 @@ export async function streamSession(
     throw new Error(`Stream failed [req ${rid}]: ${await res.text()}`);
   }
   if (!res.body) throw new Error('No response body for stream');
+  return res.body.getReader();
+}
 
-  const reader = res.body.getReader();
+export async function readStreamEvents(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onEvent: (event: SSEEvent) => Promise<void>,
+): Promise<void> {
   const decoder = new TextDecoder();
   let buffer = '';
 

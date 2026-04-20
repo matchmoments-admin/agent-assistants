@@ -1,5 +1,5 @@
 import type { Env, SSEEvent } from './claude';
-import { kv, startSession, sendPrompt, sendToolResult, streamSession, archiveSession } from './claude';
+import { kv, startSession, sendPrompt, sendToolResult, openStream, readStreamEvents, archiveSession } from './claude';
 import { trackCostFromSession } from './cost-control';
 import { executeCustomTool } from './tools';
 import type { BrandConfig } from '../config/types';
@@ -47,6 +47,11 @@ export async function runAgentSession(
   }
 }
 
+interface ToolResultPayload {
+  toolId: string;
+  result: string;
+}
+
 async function runSessionLoop(
   env: Env,
   config: BrandConfig,
@@ -54,20 +59,33 @@ async function runSessionLoop(
   sessionId: string,
   prompt: string,
 ): Promise<void> {
-  await sendPrompt(env, sessionId, prompt);
-
   let done = false;
   let turns = 0;
+  let firstTurn = true;
+  let queuedToolResults: ToolResultPayload[] = [];
 
   while (!done) {
     if (++turns > MAX_TURNS) {
       throw new Error(`Session ${sessionId} exceeded MAX_TURNS (${MAX_TURNS})`);
     }
 
+    // Open the SSE stream BEFORE posting any input so we never miss early events.
+    const reader = await openStream(env, sessionId);
+
+    if (firstTurn) {
+      await sendPrompt(env, sessionId, prompt);
+      firstTurn = false;
+    } else {
+      for (const { toolId, result } of queuedToolResults) {
+        await sendToolResult(env, sessionId, toolId, result);
+      }
+      queuedToolResults = [];
+    }
+
     const pendingTools: PendingToolCall[] = [];
     let stopReasonType = '';
 
-    await streamSession(env, sessionId, async (event: SSEEvent) => {
+    await readStreamEvents(reader, async (event: SSEEvent) => {
       switch (event.type) {
         case 'agent.custom_tool_use': {
           pendingTools.push({
@@ -77,6 +95,17 @@ async function runSessionLoop(
           });
           break;
         }
+        case 'agent.tool_use':
+        case 'agent.mcp_tool_use':
+        case 'agent.tool_result': {
+          const name = (event.name as string | undefined) ?? (event.tool_use?.name as string | undefined) ?? '?';
+          console.log(`[${agentName}] ${event.type} ${name}`);
+          break;
+        }
+        case 'session.error': {
+          const payload = JSON.stringify(event.error ?? event);
+          throw new Error(`Session ${sessionId} session.error: ${payload.slice(0, 500)}`);
+        }
         case 'session.status_idle': {
           stopReasonType = event.stop_reason?.type as string ?? 'end_turn';
           break;
@@ -85,13 +114,22 @@ async function runSessionLoop(
           console.log(`[${agentName}] ${event.content ?? ''}`);
           break;
         }
+        default: {
+          console.debug(`[${agentName}] unhandled event type=${event.type}`);
+        }
       }
     });
 
-    if (stopReasonType === 'requires_action' && pendingTools.length > 0) {
+    if (stopReasonType === 'requires_action') {
+      if (pendingTools.length === 0) {
+        throw new Error(
+          `Session ${sessionId} paused on requires_action with no custom tools to execute. ` +
+          `The agent likely wants a non-custom tool_confirmation (MCP/built-in), which is not yet wired — see plan Phase 1.5.`,
+        );
+      }
       for (const tool of pendingTools) {
         const result = await executeCustomTool(env, config, tool.name, tool.input);
-        await sendToolResult(env, sessionId, tool.id, result);
+        queuedToolResults.push({ toolId: tool.id, result });
       }
     } else {
       done = true;

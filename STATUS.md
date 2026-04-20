@@ -26,6 +26,26 @@ Also landed alongside:
 - `src/lib/telegram.ts` — webhook secret compared with constant-time helper (was `!==`, timing-unsafe), `update_id` deduped via KV with 24h TTL to absorb Telegram's retry behaviour.
 - `CLAUDE.md` implementation-details paragraph rewritten to match the confirmed shape.
 
+## Audit follow-up round 2 — 2026-04-20
+
+A second audit brief surfaced architectural latent bugs in `session-runner.ts` that could cause silent hangs or false-success exits. Shipped (version `d66f174d`):
+
+- **Stream-first ordering** (`openStream` + `readStreamEvents` in `claude.ts`): the SSE stream is now subscribed before `sendPrompt` / `sendToolResult`, closing a race window where early events could be emitted before we're listening.
+- **Strict `requires_action` handling**: if `session.status_idle` fires with `stop_reason: requires_action` but no `agent.custom_tool_use` events were buffered, the loop now throws `Session <id> paused on requires_action ...` instead of silently marking the run as done. Hooks into the existing Telegram error reporting.
+- **Full event coverage**: added handlers for `agent.tool_use`, `agent.mcp_tool_use`, `agent.tool_result` (log-only, server-executed), and `session.error` (throws with payload). `default` case logs unknown event types at debug level so schema additions surface instead of hiding.
+- **Tool-result queueing**: when a tool round-trip happens, results are now queued and sent AFTER the next stream is open, preserving the same stream-first ordering on subsequent turns.
+
+Deferred to a follow-up commit:
+
+- **Agent version pinning** (`{ type: 'agent', id, version }`) — the response shape from `POST /v1/agents` / `GET /v1/agents/{id}` doesn't obviously include a `version` field (contract test output shows agents without it). Needs a short probe of the `/v1/agents/{id}` GET response to identify the version field name before we can pin. Filed in backlog.
+
+## Phase 1 — Verification checklist (post-round-2)
+- [x] `scripts/contract-test.mjs` — all 4 checks pass against live API after the refactor
+- [ ] `/tweet test` via Telegram — happy path reaches Notion (requires Paid plan, active as of 2026-04-20)
+- [ ] `/blog <topic>` — exercises `sendToolResult` queue path
+- [ ] `/feature add test readme` — Code agent full loop including PR open
+- [ ] After green: remove `DEBUG_AGENT_API` echoes + secret (Phase 0.6 in plan)
+
 **Verification checklist:**
 - [x] `scripts/contract-test.mjs` — all 4 checks pass against live API
 - [ ] `/tweet test` via Telegram — 200 on session create + first event, draft arrives in Notion
