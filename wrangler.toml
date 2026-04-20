@@ -3,6 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 
+[limits]
+cpu_ms = 300000
+
 [[kv_namespaces]]
 binding = "AGENT_CONFIG"
 id = "b795557a60614036bc21b9997b3598aa"
