@@ -2,7 +2,67 @@
 
 > Living document. Update this as setup progresses.
 
-Last updated: 2026-04-20
+Last updated: 2026-04-21
+
+## 2026-04-21 — Reliability + security hardening + image agent
+
+Shipped in commits `e11350b` (hardening) and `562f94e` (image agent):
+
+**Hardening (`src/lib/claude.ts` + `src/lib/telegram.ts`):**
+- `fetchWithRetry()` on every Anthropic call — retries 429 / 529 / 500–504 with honour for `retry-after`. Cap 3 attempts.
+- `scrubSecrets()` redacts `sk-ant-*`, `ghp_*`, `github_pat_*`, `ghs_*`, Telegram bot tokens, `Bearer ***` and `secret_*` patterns before any text reaches Telegram.
+- Per-user rate limit: 5 commands/5 min and 30/day per `user_id` via KV sliding window.
+- `DEBUG_AGENT_API` flag + secret removed. Contract test is the drift alarm.
+
+**Image agent (`.claude/skills/` + `.claude/agents/` + `.mcp.json` + 2 new Worker endpoints):**
+- Four subagents at `.claude/agents/`: `illustration-briefer` (haiku), `variant-judge` (sonnet), `illustration-pipeline` (orchestrator), `telegram-approver` (haiku, optional).
+- Skills copied from user-scope: `gemini-generate-illustration.md` + styles + `optimize-images.md`.
+- `.mcp.json` wires Gemini (via `@rlabs-inc/gemini-mcp`) and a filesystem server scoped to `~/Desktop/ask-arthur/` so the pipeline can write `public/illustrations/arthur/<slug>/{webp,avif}` into the website repo.
+- Worker endpoints `POST /illustrate/start` + `GET /illustrate/poll` + `illustrate_*` callback handler for the optional Telegram approval gate.
+- New secret: `ILLUSTRATE_SECRET` (shared between Worker and local Claude Code subagent).
+
+## What you still need to do (ops actions)
+
+None of these are code; they're one-time setup tasks outside this repo. Tackle at your own pace.
+
+### Unblock the `/publish` newsletter send
+1. **Activate Mailgun domain.** Mailgun dashboard → Sending → Domains → `mg.askarthur.au` → click resend-activation link → open the email → activate. Then verify all 6 DNS records show green. Until this is done, `/publish` can publish to Ghost but the newsletter email to subscribers will fail silently.
+2. **Connect Mailgun to Ghost.** Ghost admin → Settings → Email newsletter → Connect Mailgun → paste the Mailgun private API key. Required only for the newsletter leg; the blog post itself publishes fine without it.
+
+### Secure the code-writing path (`/feature` flow)
+3. **GitHub App migration** (recommended, ~30 min). Create a GitHub App `askarthur-code-agent` with permissions `Contents: RW`, `Pull requests: RW`, `Metadata: R`. Install on `matchmoments-admin/ask-arthur` only. Set secrets `GITHUB_APP_ID` + `GITHUB_APP_INSTALLATION_ID` + `GITHUB_APP_PRIVATE_KEY` via `wrangler secret put`. Then revoke the current PAT. Commits via `createCommitOnBranch` GraphQL become signed + `Verified`. Code changes to wire this up are NOT yet shipped — ask for them when ready.
+4. **Tighten branch protection** on `ask-arthur` main (GitHub UI, ~5 min): require linear history, signed commits, Code Owners review on `.github/**` + `src/**`, required status checks (`path-check`, `gitleaks`). Disable admin bypass.
+
+### Local shell setup for the image agent
+5. **Export `ILLUSTRATE_SECRET`** in your shell (the value was displayed during setup):
+   ```bash
+   export ILLUSTRATE_SECRET=<the hex value from setup>
+   ```
+   Or add it to `agent-fleet/.dev.vars` for Claude Code to pick up. Without it, the `telegram-approver` subagent can't authenticate to `/illustrate/start`. Not required if you only use the desk-mode illustration flow.
+6. **Optional: symlink subagents to user scope** so `claude "illustrate: ..."` works from any directory:
+   ```bash
+   mkdir -p ~/.claude/agents && \
+   ln -sfn /Users/brendanmilton/Desktop/agent-fleet/.claude/agents ~/.claude/agents/ask-arthur-illustration
+   ```
+
+### Smoke tests to validate end-to-end
+7. **Approval loop:** `/tweet test` → wait ~60-90s → Telegram message with Notion link + ✅/❌ → tap ✅ Approve → Notion Status = Approved. If the Notion PATCH fails, the confirmation ends with `(Notion update failed: ...)`.
+8. **Publish loop:** Once at least one Blog Drafts row is `Status=Approved`, run `/publish` in Telegram → Ghost publishes the post → Notion Status flips to Published → `Published URL` column populated (add that column first).
+9. **Image agent desk flow:** `claude "illustrate: Arthur explaining compound interest, warm editorial, 4:3"` (run from a directory Claude Code discovers the agents — either `~/Desktop/agent-fleet` or any dir with the symlink from step 6). Expect brief → 3 variants → judge → winner → commit in `ask-arthur` repo.
+10. **Image agent Telegram flow:** Same command with `--telegram`. Expect the winner to land in Telegram with Approve/Reject/Regen keyboard.
+
+## Still deferred (tracked for later sprints)
+
+- **Structured JSON logs** — single `log({ level, event, fields })` helper emitting JSON with `anthropic_request_id`, `session_id`, `agent_id`, `tg_user_id`, `command`, `duration_ms`. Requires touching every `console.log`/`warn` call; medium refactor.
+- **Workspace split** — `askarthur-dev` + `askarthur-prod` Anthropic workspaces with per-workspace keys + spend caps. Anthropic Console operation.
+- **Idempotency keys on PR branches** — derive branch name from `hash(chat_id, message_id, command)` so Telegram retries don't double-PR. Low priority given our `update_id` dedup.
+- **Agent version pinning** — `{type: 'agent', id, version}` for reproducibility. Needs verification of the `/v1/agents/{id}` response version field; `updateAgent` already uses optimistic-lock version in POST body, so the read path works.
+- **Progress streaming to Telegram** — debounced `editMessageText` during agent runs. UX polish, not reliability.
+- **SDK migration** — re-evaluate `@anthropic-ai/sdk` on its next minor release; its current event-type params happen to match server behaviour, so deferral is safe.
+- **Pre-PR diff validator in Code agent** — lives naturally in the `ask-arthur` repo's CI workflow, not in `agent-fleet`. Filed there.
+- **Sandbox egress allowlist** — needs a day of outbound-call logging to inventory hosts before we can set `networking: {type:'limited', allowed_hosts:[...]}`.
+- **Palette-drift QA agent** — weekly check across `public/illustrations/arthur/**`. Revisit when the catalog grows past ~50 images.
+
 
 ## Schema migration — 2026-04-20
 
