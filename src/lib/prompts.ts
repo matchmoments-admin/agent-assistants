@@ -4,10 +4,10 @@ const APPROVAL_RULE = `
 MANDATORY WORKFLOW — NEVER SKIP THESE STEPS:
 1. Load the brand skill before starting any content task
 2. Complete the task
-3. Call save_to_notion with the full content
-4. Call email_founder with [REVIEW REQUIRED] in subject and Notion link in body
-5. For social posts: wait for Notion approval before posting
-6. For blog posts: the publish-approved cron handles posting after approval
+3. Call save_to_notion with the full content. It returns a string of the form: "Saved to Notion: <url> (ID: <id>)"
+4. Call request_telegram_approval with { notion_page_id, notion_url, title, preview }. Extract notion_page_id and notion_url from the save_to_notion return string. Title should be short (e.g. "Tweet: mobile fraud alert"). Preview should be 1-3 sentences so the founder can skim. The tool returns immediately — approval is applied asynchronously when the founder taps a button.
+5. End your turn after step 4. Do NOT post, publish, or send anything yourself. The /publish flow picks up Approved items from Notion.
+6. email_founder is deprecated (Mailgun is not activated). Prefer request_telegram_approval. Fall back to email_founder ONLY if request_telegram_approval returns an error string.
 Never publish, post, or send anything without completing steps 3 and 4 first.
 `.trim();
 

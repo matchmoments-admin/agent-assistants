@@ -70,6 +70,21 @@ export const CONTENT_TOOLS = [
       required: ['subject', 'body'],
     },
   },
+  {
+    type: 'custom',
+    name: 'request_telegram_approval',
+    description: 'Sends the founder a Telegram message with a link to the Notion draft and Approve/Reject buttons. Use this INSTEAD of email_founder whenever possible — email delivery is currently unreliable. Call AFTER save_to_notion, passing the notion_page_id and notion_url returned from that tool. Do not wait for the decision — this tool returns immediately and approval is applied asynchronously (the Notion Status flips to Approved or Rejected when the founder taps a button).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        notion_page_id: { type: 'string', description: 'The Notion page ID from save_to_notion result (the UUID with dashes)' },
+        notion_url: { type: 'string', description: 'The full Notion page URL from save_to_notion result' },
+        title: { type: 'string', description: 'Short title for the Telegram message (e.g. "Tweet: Mobile fraud alert")' },
+        preview: { type: 'string', description: 'Optional 1-3 sentence preview so the founder can gauge the content without opening Notion' },
+      },
+      required: ['notion_page_id', 'notion_url', 'title'],
+    },
+  },
 ];
 
 // Tools for the Code Agent

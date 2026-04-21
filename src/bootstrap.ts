@@ -1,5 +1,5 @@
 import type { Env } from './lib/claude';
-import { ensureEnvironment, createAgent, kv } from './lib/claude';
+import { ensureEnvironment, createAgent, updateAgent, kv } from './lib/claude';
 import { loadBrandConfig } from './config/loader';
 import { cmoSystemPrompt, cpoSystemPrompt, growthSystemPrompt, irSystemPrompt, codeSystemPrompt } from './lib/prompts';
 import { CONTENT_TOOLS, CODE_TOOLS } from './lib/agent-tools';
@@ -51,4 +51,35 @@ export async function bootstrap(env: Env): Promise<BootstrapResult> {
   }
 
   return { environmentId, skillId, agents };
+}
+
+// Push the current system prompts + tool lists to already-created agents.
+// POST /v1/agents/{id} creates a new version; sessions pick up the latest.
+export async function updateAllAgents(env: Env): Promise<{ updated: string[]; missing: string[] }> {
+  const config = loadBrandConfig(env);
+  const skillId = await kv.get(env, `skill_id:${config.skillName}`);
+  if (!skillId) throw new Error('Skill not bootstrapped. Run /setup first.');
+
+  const agentDefs = [
+    { name: 'cmo', prompt: cmoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
+    { name: 'cpo', prompt: cpoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
+    { name: 'growth', prompt: growthSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
+    { name: 'ir', prompt: irSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
+    { name: 'code', prompt: codeSystemPrompt(config, env.GH_REPO), tools: CODE_TOOLS, skills: [] as string[] },
+  ];
+
+  const updated: string[] = [];
+  const missing: string[] = [];
+
+  for (const def of agentDefs) {
+    const cachedId = await kv.get(env, `agent_${def.name}`);
+    if (!cachedId) {
+      missing.push(def.name);
+      continue;
+    }
+    await updateAgent(env, cachedId, def.name, def.prompt, def.tools, def.skills);
+    updated.push(def.name);
+  }
+
+  return { updated, missing };
 }

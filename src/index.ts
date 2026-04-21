@@ -2,7 +2,7 @@ import { AgentMemory } from './memory';
 import type { Env, AgentTaskMessage } from './lib/claude';
 import { loadBrandConfig } from './config/loader';
 import { checkBudgetOrAbort } from './lib/cost-control';
-import { bootstrap } from './bootstrap';
+import { bootstrap, updateAllAgents } from './bootstrap';
 import { runCPOAgent } from './agents/cpo';
 import { runCMOAgent } from './agents/cmo';
 import { runGrowthAgent } from './agents/growth';
@@ -54,6 +54,18 @@ export default {
       } catch (err) {
         return Response.json(
           { error: err instanceof Error ? err.message : 'Bootstrap failed' },
+          { status: 500 },
+        );
+      }
+    }
+
+    if (url.pathname === '/update-agents' && request.method === 'POST') {
+      try {
+        const result = await updateAllAgents(env);
+        return Response.json(result, { status: 200 });
+      } catch (err) {
+        return Response.json(
+          { error: err instanceof Error ? err.message : 'Update failed' },
           { status: 500 },
         );
       }

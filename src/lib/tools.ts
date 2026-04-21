@@ -21,6 +21,8 @@ export async function executeCustomTool(
       return postToLinkedIn(env, config, input.text as string);
     case 'email_founder':
       return emailFounder(env, config, input);
+    case 'request_telegram_approval':
+      return requestTelegramApproval(env, input);
 
     // Code agent tools
     case 'gh_list_dir':
@@ -485,6 +487,66 @@ async function postToLinkedIn(
 }
 
 // ── Email founder (Mailgun) ───────────────────────────────────────────────────
+
+async function requestTelegramApproval(
+  env: Env,
+  input: Record<string, unknown>,
+): Promise<string> {
+  const notionPageId = input.notion_page_id as string;
+  const notionUrl = input.notion_url as string;
+  const title = (input.title as string) ?? 'Draft ready for review';
+  const preview = (input.preview as string) ?? '';
+
+  if (!notionPageId || !notionUrl) {
+    return 'Error: notion_page_id and notion_url are required';
+  }
+
+  const allowedIds = env.TELEGRAM_ALLOWED_IDS.split(',').map(s => s.trim()).filter(Boolean);
+  if (allowedIds.length === 0) return 'Error: no TELEGRAM_ALLOWED_IDS configured';
+  const chatId = parseInt(allowedIds[0], 10);
+
+  const nonce = crypto.randomUUID();
+  await env.AGENT_CONFIG.put(
+    `approval:${nonce}`,
+    JSON.stringify({
+      notion_page_id: notionPageId,
+      status: 'pending',
+      title,
+      created_at: Date.now(),
+    }),
+    { expirationTtl: 7 * 24 * 60 * 60 }, // 7 days
+  );
+
+  const body = preview
+    ? `<b>📋 ${escapeHtml(title)}</b>\n\n${escapeHtml(preview)}\n\n<a href="${notionUrl}">Review full draft in Notion</a>`
+    : `<b>📋 ${escapeHtml(title)}</b>\n\n<a href="${notionUrl}">Review full draft in Notion</a>`;
+
+  const keyboard = {
+    inline_keyboard: [[
+      { text: '✅ Approve', callback_data: `approve_ok:${nonce}` },
+      { text: '❌ Reject', callback_data: `approve_no:${nonce}` },
+    ]],
+  };
+
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: body,
+      parse_mode: 'HTML',
+      disable_web_page_preview: false,
+      reply_markup: keyboard,
+    }),
+  });
+
+  if (!res.ok) return `Telegram error: ${await res.text()}`;
+  return `Approval request sent to Telegram (nonce ${nonce.slice(0, 8)}). Waiting for human decision; this tool does not block — continue with your other tasks.`;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
 async function emailFounder(
   env: Env,

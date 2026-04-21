@@ -148,6 +148,43 @@ export async function createAgent(
   return data.id;
 }
 
+export async function updateAgent(
+  env: Env,
+  agentId: string,
+  name: string,
+  systemPrompt: string,
+  customTools: object[],
+  skillIds: string[] = [],
+  mcpServers: object[] = [],
+  model = 'claude-sonnet-4-6',
+): Promise<void> {
+  // Fetch the current version so we can send version+1 as the new version.
+  const getRes = await fetch(`${BASE}/v1/agents/${agentId}`, { headers: headers(env) });
+  if (!getRes.ok) {
+    const rid = getRes.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Fetch agent ${agentId} failed [req ${rid}]: ${await getRes.text()}`);
+  }
+  const current = await getRes.json() as { version?: number };
+
+  const res = await fetch(`${BASE}/v1/agents/${agentId}`, {
+    method: 'POST',
+    headers: headers(env),
+    body: JSON.stringify({
+      version: current.version ?? 1,
+      name: `${name}-${env.PRODUCT_ID}`,
+      model,
+      system: systemPrompt,
+      tools: [{ type: 'agent_toolset_20260401' }, ...customTools],
+      skills: skillIds.map(skill_id => ({ type: 'custom', skill_id })),
+      mcp_servers: [...mcpServers],
+    }),
+  });
+  if (!res.ok) {
+    const rid = res.headers.get('request-id') ?? 'unknown';
+    throw new Error(`Update agent ${agentId} failed [req ${rid}]: ${await res.text()}`);
+  }
+}
+
 export async function startSession(
   env: Env,
   agentId: string,

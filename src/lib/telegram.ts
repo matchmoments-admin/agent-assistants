@@ -288,6 +288,11 @@ async function handleCallbackQuery(
   const messageId = query.message.message_id;
   const [action, nonce] = query.data.split(':');
 
+  // Approval flow has its own KV prefix, 7d TTL, and updates Notion directly.
+  if (action === 'approve_ok' || action === 'approve_no') {
+    return handleApprovalCallback(query, env, action, nonce, chatId, messageId);
+  }
+
   // Validate nonce — check both deploy: and feature: prefixes
   let raw = await env.AGENT_CONFIG.get(`deploy:${nonce}`);
   let nonceKey = `deploy:${nonce}`;
@@ -428,6 +433,60 @@ async function editMessage(env: Env, chatId: number, messageId: number, text: st
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML' }),
   });
+}
+
+async function handleApprovalCallback(
+  query: NonNullable<TelegramUpdate['callback_query']>,
+  env: Env,
+  action: string,
+  nonce: string,
+  chatId: number,
+  messageId: number,
+): Promise<Response> {
+  const key = `approval:${nonce}`;
+  const raw = await env.AGENT_CONFIG.get(key);
+  if (!raw) {
+    await answerCallback(env, query.id, 'Expired.');
+    await editMessage(env, chatId, messageId, '\u23F1 Approval expired.');
+    return new Response('OK', { status: 200 });
+  }
+  const data = JSON.parse(raw) as { notion_page_id: string; status: string; title: string; created_at: number };
+
+  const approving = action === 'approve_ok';
+  const newStatus = approving ? 'Approved' : 'Rejected';
+
+  // Update Notion page Status (if the DB has that column — tolerate failure).
+  const notionRes = await fetch(`https://api.notion.com/v1/pages/${data.notion_page_id}`, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': `Bearer ${env.NOTION_TOKEN}`,
+      'Content-Type': 'application/json',
+      'Notion-Version': '2022-06-28',
+    },
+    body: JSON.stringify({
+      properties: { Status: { select: { name: newStatus } } },
+    }),
+  });
+  const notionOk = notionRes.ok;
+  const notionError = notionOk ? '' : ` (Notion update failed: ${(await notionRes.text()).slice(0, 200)})`;
+
+  // Record decision + archive the KV entry for audit (short TTL).
+  await env.AGENT_CONFIG.put(key, JSON.stringify({
+    ...data,
+    status: newStatus.toLowerCase(),
+    decided_by: query.from.id,
+    decided_at: Date.now(),
+  }), { expirationTtl: 7 * 24 * 60 * 60 });
+
+  const icon = approving ? '\u2705' : '\u274C';
+  await answerCallback(env, query.id, approving ? 'Approved' : 'Rejected');
+  await editMessage(env, chatId, messageId,
+    `${icon} <b>${escapeHtml(data.title)}</b> \u2014 ${newStatus} by user ${query.from.id}${notionError}`);
+  return new Response('OK', { status: 200 });
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 async function answerCallback(env: Env, callbackId: string, text: string): Promise<void> {
