@@ -28,6 +28,9 @@ export interface Env {
   TELEGRAM_ALLOWED_IDS: string;
   TELEGRAM_WEBHOOK_SECRET: string;
   GITHUB_PAT: string;
+  GITHUB_APP_ID?: string;
+  GITHUB_APP_INSTALLATION_ID?: string;
+  GITHUB_APP_PRIVATE_KEY?: string;
   DEPLOY_HOOK_URL: string;
   GH_REPO: string;
   ILLUSTRATE_SECRET?: string;

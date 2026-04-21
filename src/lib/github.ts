@@ -2,9 +2,72 @@ import type { Env } from './claude';
 
 const BASE = 'https://api.github.com';
 
-function ghHeaders(env: Env): HeadersInit {
+// Installation-token cache (module-level; shared across invocations in the same isolate).
+// GitHub App installation tokens are valid ~1 hour; we refresh 1 minute early.
+let cachedToken: { token: string; expiresAt: number } | null = null;
+
+function base64url(input: string | Uint8Array): string {
+  const str = typeof input === 'string' ? input : String.fromCharCode(...input);
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function generateAppJwt(appId: string, privateKeyPem: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const payload = { iat: now - 60, exp: now + 9 * 60, iss: appId };
+  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
+
+  // Strip PEM headers (accept both PKCS#1 "RSA PRIVATE KEY" and PKCS#8 "PRIVATE KEY")
+  const pemBody = privateKeyPem
+    .replace(/-----BEGIN (RSA )?PRIVATE KEY-----/, '')
+    .replace(/-----END (RSA )?PRIVATE KEY-----/, '')
+    .replace(/\\n/g, '\n')
+    .replace(/\s/g, '');
+  const keyBytes = Uint8Array.from(atob(pemBody), c => c.charCodeAt(0));
+
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    keyBytes,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    new TextEncoder().encode(signingInput),
+  );
+  return `${signingInput}.${base64url(new Uint8Array(signature))}`;
+}
+
+async function getInstallationToken(env: Env): Promise<string> {
+  if (cachedToken && cachedToken.expiresAt > Date.now() + 60_000) {
+    return cachedToken.token;
+  }
+  const jwt = await generateAppJwt(env.GITHUB_APP_ID!, env.GITHUB_APP_PRIVATE_KEY!);
+  const res = await fetch(
+    `${BASE}/app/installations/${env.GITHUB_APP_INSTALLATION_ID}/access_tokens`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${jwt}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'askarthur-agent-fleet',
+      },
+    },
+  );
+  if (!res.ok) throw new Error(`GitHub App token exchange failed: ${await res.text()}`);
+  const data = await res.json() as { token: string; expires_at: string };
+  cachedToken = { token: data.token, expiresAt: new Date(data.expires_at).getTime() };
+  return data.token;
+}
+
+async function ghHeaders(env: Env): Promise<HeadersInit> {
+  const usingApp = env.GITHUB_APP_ID && env.GITHUB_APP_INSTALLATION_ID && env.GITHUB_APP_PRIVATE_KEY;
+  const token = usingApp ? await getInstallationToken(env) : env.GITHUB_PAT;
   return {
-    'Authorization': `Bearer ${env.GITHUB_PAT}`,
+    'Authorization': `Bearer ${token}`,
     'Accept': 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
     'User-Agent': 'askarthur-agent-fleet',
@@ -14,7 +77,7 @@ function ghHeaders(env: Env): HeadersInit {
 export async function getRepoTree(env: Env, ref = 'main'): Promise<string[]> {
   const res = await fetch(
     `${BASE}/repos/${env.GH_REPO}/git/trees/${ref}?recursive=1`,
-    { headers: ghHeaders(env) },
+    { headers: await ghHeaders(env) },
   );
   if (!res.ok) throw new Error(`getRepoTree failed: ${await res.text()}`);
   const data = await res.json() as { tree: Array<{ path: string; type: string }> };
@@ -29,7 +92,7 @@ interface FileContent {
 export async function readFile(env: Env, path: string, ref = 'main'): Promise<FileContent> {
   const res = await fetch(
     `${BASE}/repos/${env.GH_REPO}/contents/${encodeURIComponent(path)}?ref=${ref}`,
-    { headers: ghHeaders(env) },
+    { headers: await ghHeaders(env) },
   );
   if (!res.ok) throw new Error(`readFile(${path}) failed: ${await res.text()}`);
   const data = await res.json() as { content: string; encoding: string; sha: string };
@@ -43,7 +106,7 @@ export async function listDir(env: Env, path: string, ref = 'main'): Promise<Arr
   const url = path
     ? `${BASE}/repos/${env.GH_REPO}/contents/${encodeURIComponent(path)}?ref=${ref}`
     : `${BASE}/repos/${env.GH_REPO}/contents?ref=${ref}`;
-  const res = await fetch(url, { headers: ghHeaders(env) });
+  const res = await fetch(url, { headers: await ghHeaders(env) });
   if (!res.ok) throw new Error(`listDir(${path}) failed: ${await res.text()}`);
   const data = await res.json() as Array<{ name: string; type: string; path: string }>;
   return data;
@@ -53,7 +116,7 @@ export async function createBranch(env: Env, branchName: string, fromBranch = 'm
   // Get SHA of source branch
   const refRes = await fetch(
     `${BASE}/repos/${env.GH_REPO}/git/refs/heads/${fromBranch}`,
-    { headers: ghHeaders(env) },
+    { headers: await ghHeaders(env) },
   );
   if (!refRes.ok) throw new Error(`Get ref failed: ${await refRes.text()}`);
   const refData = await refRes.json() as { object: { sha: string } };
@@ -62,7 +125,7 @@ export async function createBranch(env: Env, branchName: string, fromBranch = 'm
   // Create new ref
   const createRes = await fetch(`${BASE}/repos/${env.GH_REPO}/git/refs`, {
     method: 'POST',
-    headers: { ...ghHeaders(env), 'Content-Type': 'application/json' },
+    headers: { ...(await ghHeaders(env)), 'Content-Type': 'application/json' },
     body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha: sourceSha }),
   });
   if (!createRes.ok) throw new Error(`createBranch failed: ${await createRes.text()}`);
@@ -96,7 +159,7 @@ export async function commitFile(
     `${BASE}/repos/${env.GH_REPO}/contents/${encodeURIComponent(path)}`,
     {
       method: 'PUT',
-      headers: { ...ghHeaders(env), 'Content-Type': 'application/json' },
+      headers: { ...(await ghHeaders(env)), 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     },
   );
@@ -114,7 +177,7 @@ export async function createPR(
 ): Promise<string> {
   const res = await fetch(`${BASE}/repos/${env.GH_REPO}/pulls`, {
     method: 'POST',
-    headers: { ...ghHeaders(env), 'Content-Type': 'application/json' },
+    headers: { ...(await ghHeaders(env)), 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, body, head, base }),
   });
   if (!res.ok) throw new Error(`createPR failed: ${await res.text()}`);
