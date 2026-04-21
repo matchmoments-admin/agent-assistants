@@ -30,7 +30,6 @@ export interface Env {
   GITHUB_PAT: string;
   DEPLOY_HOOK_URL: string;
   GH_REPO: string;
-  DEBUG_AGENT_API?: string;
   AGENT_TASKS: Queue<AgentTaskMessage>;
 }
 
@@ -44,6 +43,30 @@ export interface AgentTaskMessage {
 }
 
 const BASE = 'https://api.anthropic.com';
+
+// Retry transient failures (429 rate limit, 529 overloaded, 500/502/503/504 server)
+// with exponential backoff honouring the retry-after header.
+export async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  maxAttempts = 3,
+): Promise<Response> {
+  let lastRes: Response | undefined;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(url, init);
+    if (res.ok) return res;
+    if (res.status === 429 || res.status === 529 || (res.status >= 500 && res.status < 600)) {
+      lastRes = res;
+      if (attempt === maxAttempts) break;
+      const retryAfter = parseInt(res.headers.get('retry-after') ?? '0', 10);
+      const delay = retryAfter > 0 ? retryAfter * 1000 : Math.min(30000, 500 * 2 ** (attempt - 1));
+      await new Promise(r => setTimeout(r, delay));
+      continue;
+    }
+    return res; // 4xx other than 429 — no retry
+  }
+  return lastRes!;
+}
 
 export function headers(env: Env): HeadersInit {
   return {
@@ -192,7 +215,7 @@ export async function startSession(
   title: string,
   vaultIds: string[] = [],
 ): Promise<string> {
-  const res = await fetch(`${BASE}/v1/sessions`, {
+  const res = await fetchWithRetry(`${BASE}/v1/sessions`, {
     method: 'POST',
     headers: headers(env),
     body: JSON.stringify({
@@ -215,17 +238,13 @@ export async function sendPrompt(
   sessionId: string,
   text: string,
 ): Promise<void> {
-  const res = await fetch(`${BASE}/v1/sessions/${sessionId}/events`, {
+  const res = await fetchWithRetry(`${BASE}/v1/sessions/${sessionId}/events`, {
     method: 'POST',
     headers: headers(env),
     body: JSON.stringify({
       events: [{ type: 'user.message', content: [{ type: 'text', text }] }],
     }),
   });
-  if (env.DEBUG_AGENT_API === '1') {
-    const rid = res.headers.get('request-id') ?? 'unknown';
-    console.log(`[debug] sendPrompt status=${res.status} req=${rid} body=${await res.clone().text()}`);
-  }
   if (!res.ok) {
     const rid = res.headers.get('request-id') ?? 'unknown';
     throw new Error(`Send prompt failed [req ${rid}]: ${await res.text()}`);
@@ -238,7 +257,7 @@ export async function sendToolResult(
   toolUseId: string,
   result: string,
 ): Promise<void> {
-  const res = await fetch(`${BASE}/v1/sessions/${sessionId}/events`, {
+  const res = await fetchWithRetry(`${BASE}/v1/sessions/${sessionId}/events`, {
     method: 'POST',
     headers: headers(env),
     body: JSON.stringify({
@@ -249,10 +268,6 @@ export async function sendToolResult(
       }],
     }),
   });
-  if (env.DEBUG_AGENT_API === '1') {
-    const rid = res.headers.get('request-id') ?? 'unknown';
-    console.log(`[debug] sendToolResult status=${res.status} req=${rid} body=${await res.clone().text()}`);
-  }
   if (!res.ok) {
     const rid = res.headers.get('request-id') ?? 'unknown';
     throw new Error(`Send tool result failed [req ${rid}]: ${await res.text()}`);

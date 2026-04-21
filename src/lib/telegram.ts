@@ -76,6 +76,13 @@ export async function handleTelegramWebhook(
     return new Response('OK', { status: 200 });
   }
 
+  // Per-user rate limit: 5 commands / 5 min, 30 / day.
+  const rl = await checkRateLimit(env, message.from.id);
+  if (!rl.ok) {
+    await sendTelegram(env, message.chat.id, `Rate limited: ${rl.reason}. Try again in ${rl.retryAfterSec}s.`);
+    return new Response('OK', { status: 200 });
+  }
+
   const text = message.text.trim();
   const [commandRaw, ...args] = text.split(' ');
   const command = commandRaw.split('@')[0];
@@ -397,15 +404,62 @@ async function handleCallbackQuery(
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
+async function checkRateLimit(
+  env: Env,
+  userId: number,
+): Promise<{ ok: true } | { ok: false; reason: string; retryAfterSec: number }> {
+  const now = Date.now();
+  const shortKey = `rl:${userId}:5min:${Math.floor(now / 300_000)}`;
+  const dayKey = `rl:${userId}:day:${new Date(now).toISOString().slice(0, 10)}`;
+
+  const [shortCount, dayCount] = await Promise.all([
+    env.AGENT_CONFIG.get(shortKey).then(v => parseInt(v ?? '0', 10)),
+    env.AGENT_CONFIG.get(dayKey).then(v => parseInt(v ?? '0', 10)),
+  ]);
+
+  if (shortCount >= 5) {
+    const nextWindow = (Math.floor(now / 300_000) + 1) * 300_000;
+    return { ok: false, reason: '5 commands per 5 min', retryAfterSec: Math.ceil((nextWindow - now) / 1000) };
+  }
+  if (dayCount >= 30) {
+    return { ok: false, reason: '30 commands per day', retryAfterSec: 3600 };
+  }
+
+  await Promise.all([
+    env.AGENT_CONFIG.put(shortKey, String(shortCount + 1), { expirationTtl: 600 }),
+    env.AGENT_CONFIG.put(dayKey, String(dayCount + 1), { expirationTtl: 86400 * 2 }),
+  ]);
+
+  return { ok: true };
+}
+
 function isAllowed(env: Env, userId: number): boolean {
   return env.TELEGRAM_ALLOWED_IDS.split(',').map(id => parseInt(id.trim(), 10)).includes(userId);
+}
+
+// Redact any secret-shaped strings that may have leaked into error text
+// before it reaches Telegram (user-visible) or Worker logs (opaque-ish).
+const SECRET_PATTERNS: Array<[RegExp, string]> = [
+  [/sk-ant-[A-Za-z0-9_-]{20,}/g, '[REDACTED:ANTHROPIC_KEY]'],
+  [/ghp_[A-Za-z0-9]{30,}/g, '[REDACTED:GITHUB_PAT]'],
+  [/github_pat_[A-Za-z0-9_]{60,}/g, '[REDACTED:GITHUB_PAT]'],
+  [/ghs_[A-Za-z0-9]{30,}/g, '[REDACTED:GITHUB_TOKEN]'],
+  [/\d{8,10}:[A-Za-z0-9_-]{30,}/g, '[REDACTED:TELEGRAM_TOKEN]'],
+  [/Bearer\s+[A-Za-z0-9._-]{20,}/g, 'Bearer [REDACTED]'],
+  [/secret[-_]?[A-Za-z0-9_-]{20,}/gi, '[REDACTED:SECRET]'],
+];
+
+export function scrubSecrets(text: string): string {
+  let out = text;
+  for (const [re, replacement] of SECRET_PATTERNS) out = out.replace(re, replacement);
+  return out;
 }
 
 export async function sendTelegram(env: Env, chatId: number, text: string): Promise<void> {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
+    body: JSON.stringify({ chat_id: chatId, text: scrubSecrets(text), parse_mode: 'HTML' }),
   });
 }
 
