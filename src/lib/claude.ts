@@ -30,6 +30,7 @@ export interface Env {
   GITHUB_PAT: string;
   DEPLOY_HOOK_URL: string;
   GH_REPO: string;
+  ILLUSTRATE_SECRET?: string;
   AGENT_TASKS: Queue<AgentTaskMessage>;
 }
 

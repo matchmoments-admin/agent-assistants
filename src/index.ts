@@ -105,6 +105,57 @@ export default {
       }
     }
 
+    if (url.pathname === '/illustrate/start' && request.method === 'POST') {
+      const secret = request.headers.get('X-Illustrate-Secret') ?? '';
+      if (!env.ILLUSTRATE_SECRET || secret !== env.ILLUSTRATE_SECRET) {
+        return new Response('Unauthorized', { status: 403 });
+      }
+      const body = await request.json() as {
+        nonce: string; slug: string; imageUrl: string; caption?: string;
+      };
+      if (!body.nonce || !body.slug || !body.imageUrl) {
+        return Response.json({ error: 'nonce, slug, imageUrl required' }, { status: 400 });
+      }
+      const chatId = parseInt(env.TELEGRAM_ALLOWED_IDS.split(',')[0].trim(), 10);
+      await env.AGENT_CONFIG.put(
+        `illustrate:${body.nonce}`,
+        JSON.stringify({ status: 'pending', slug: body.slug, createdAt: Date.now() }),
+        { expirationTtl: 900 },
+      );
+      const kbd = {
+        inline_keyboard: [[
+          { text: '\u2705 Approve', callback_data: `illustrate_ok:${body.nonce}` },
+          { text: '\u274C Reject', callback_data: `illustrate_no:${body.nonce}` },
+          { text: '\uD83D\uDD04 Regen', callback_data: `illustrate_regen:${body.nonce}` },
+        ]],
+      };
+      const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          photo: body.imageUrl,
+          caption: body.caption ?? `Illustration: ${body.slug}`,
+          reply_markup: kbd,
+        }),
+      });
+      if (!res.ok) return Response.json({ error: `Telegram: ${await res.text()}` }, { status: 502 });
+      return Response.json({ ok: true, nonce: body.nonce });
+    }
+
+    if (url.pathname === '/illustrate/poll' && request.method === 'GET') {
+      const secret = request.headers.get('X-Illustrate-Secret') ?? '';
+      if (!env.ILLUSTRATE_SECRET || secret !== env.ILLUSTRATE_SECRET) {
+        return new Response('Unauthorized', { status: 403 });
+      }
+      const nonce = url.searchParams.get('nonce');
+      if (!nonce) return Response.json({ error: 'nonce required' }, { status: 400 });
+      const raw = await env.AGENT_CONFIG.get(`illustrate:${nonce}`);
+      if (!raw) return Response.json({ status: 'expired' });
+      const data = JSON.parse(raw) as { status: string };
+      return Response.json({ status: data.status });
+    }
+
     if (url.pathname === '/telegram' && request.method === 'POST') {
       const config = loadBrandConfig(env);
       return handleTelegramWebhook(request, env, config, ctx);

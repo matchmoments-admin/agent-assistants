@@ -300,6 +300,25 @@ async function handleCallbackQuery(
     return handleApprovalCallback(query, env, action, nonce, chatId, messageId);
   }
 
+  // Illustration flow: local Claude Code subagent polls the status KV.
+  if (action === 'illustrate_ok' || action === 'illustrate_no' || action === 'illustrate_regen') {
+    const key = `illustrate:${nonce}`;
+    const raw = await env.AGENT_CONFIG.get(key);
+    if (!raw) {
+      await answerCallback(env, query.id, 'Expired.');
+      return new Response('OK', { status: 200 });
+    }
+    const data = JSON.parse(raw) as { status: string; slug: string; createdAt: number };
+    const decision = action === 'illustrate_ok' ? 'approved'
+                   : action === 'illustrate_no' ? 'rejected'
+                   : 'regen';
+    await env.AGENT_CONFIG.put(key, JSON.stringify({ ...data, status: decision }), { expirationTtl: 900 });
+    const icon = decision === 'approved' ? '\u2705' : decision === 'rejected' ? '\u274C' : '\uD83D\uDD04';
+    await answerCallback(env, query.id, decision);
+    await editMessage(env, chatId, messageId, `${icon} Illustration <b>${data.slug}</b> \u2014 ${decision}`);
+    return new Response('OK', { status: 200 });
+  }
+
   // Validate nonce — check both deploy: and feature: prefixes
   let raw = await env.AGENT_CONFIG.get(`deploy:${nonce}`);
   let nonceKey = `deploy:${nonce}`;
