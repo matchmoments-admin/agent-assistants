@@ -311,17 +311,18 @@ async function publishToGhost(
 
   if (!publishRes.ok) return `Ghost publish error: ${await publishRes.text()}`;
   const publishData = await publishRes.json() as {
-    posts: Array<{ url: string; id: string }>;
+    posts: Array<{ url: string; id: string; slug: string }>;
   };
   const published = publishData.posts[0];
 
-  // Update Notion status to Published
+  // Write the canonical askarthur.au URL (mirrored via nginx) to Notion, not the Ghost origin
+  const canonicalUrl = `https://askarthur.au/blog/${published.slug}`;
   if (input.notion_page_id) {
-    await updateNotionStatus(env, input.notion_page_id as string, 'Published', published.url);
+    await updateNotionStatus(env, input.notion_page_id as string, 'Published', canonicalUrl);
   }
 
   const emailNote = sendNewsletter ? ' — newsletter sent to all subscribers' : '';
-  return `Published to Ghost: ${published.url}${emailNote}`;
+  return `Published to Ghost: ${canonicalUrl}${emailNote}`;
 }
 
 async function generateGhostToken(keyId: string, secret: string): Promise<string> {
