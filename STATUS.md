@@ -2,7 +2,51 @@
 
 > Living document. Update this as setup progresses.
 
-Last updated: 2026-04-21
+Last updated: 2026-04-23
+
+## 2026-04-23 — Ghost → Supabase mirror follow-ups
+
+Shipped in commit `700ba18`:
+
+- **Notion Published URL now uses the canonical askarthur.au mirror.** `src/lib/tools.ts` `publishToGhost()` reads the `slug` off the Ghost publish response and writes `https://askarthur.au/blog/<slug>` into the Notion `Published URL` property (instead of the `blog.askarthur.au/<slug>` origin). Humans clicking from the Notion approval flow now land on the canonical reading surface rendered by safeverify's `/blog` route (which reads from the `blog_posts` table populated by the Ghost webhook mirror — see `matchmoments-admin/ask-arthur@f37b2603` / PR #14).
+- **`blog.askarthur.au` nginx config adds a 301 to the canonical host.** `ghost-setup/nginx/conf.d/askarthur.conf.example` now keeps `/ghost`, `/members`, `/content`, `/assets`, `/public`, `/p`, `/rss`, `/sitemap*.xml`, `/robots.txt`, `/favicon.ico` on the subdomain (Ghost admin UI, members/webhook paths, images hotlinked by safeverify via CSP allowlist, feeds). Everything else 301s to `https://askarthur.au/blog$request_uri` so SEO and social signals consolidate on the canonical host.
+
+### Operator action required — apply the nginx change to the Vultr VPS
+
+The committed file is `*.example` only. To take effect:
+
+```bash
+ssh root@108.61.96.112
+# copy the updated example onto the live config (back up first)
+cp /etc/nginx/conf.d/askarthur.conf /etc/nginx/conf.d/askarthur.conf.bak.$(date +%Y%m%d)
+# paste the new contents of ghost-setup/nginx/conf.d/askarthur.conf.example into /etc/nginx/conf.d/askarthur.conf
+nginx -t
+systemctl reload nginx
+```
+
+Smoke tests after reload:
+
+```bash
+# Post slug → 301 to canonical
+curl -sI https://blog.askarthur.au/some-slug | grep -E '^HTTP|^location'
+# Expect: HTTP/2 301 + location: https://askarthur.au/blog/some-slug
+
+# Ghost admin → 200 (must NOT redirect)
+curl -sI https://blog.askarthur.au/ghost/ | grep '^HTTP'
+# Expect: HTTP/2 200
+
+# Content image → 200 (safeverify hotlinks these)
+curl -sI https://blog.askarthur.au/content/images/2026/04/foo.png | grep '^HTTP'
+# Expect: HTTP/2 200 (or 404 if that file doesn't exist, but NOT 301)
+```
+
+### Prerequisite — Notion `Published URL` column must exist
+
+The Notion DB schema documented in CLAUDE.md lists only `Name` + `Status` as the minimum. The publish tool writes to a `Published URL` property; the Notion API silently no-ops on unknown property names, so if that column isn't there, the `/publish` smoke test will look green but the URL won't appear. Add a **URL** type property named exactly `Published URL` to the Blog Drafts DB (and Social/Investor if you want the same treatment later) via the Notion UI before shipping.
+
+### Prerequisite — safeverify Ghost webhook env vars
+
+The mirror that makes `askarthur.au/blog/<slug>` actually render requires `GHOST_API_URL`, `GHOST_ADMIN_API_KEY`, and `GHOST_WEBHOOK_SECRET` in the safeverify Vercel project, plus a matching Ghost webhook integration pointing at `https://askarthur.au/api/blog/ghost-webhook`. Until those are set, the webhook route returns 500 and published posts won't appear on the main site — Notion will get the canonical URL but it'll 404. Set these via the Vercel UI; not an agent-fleet step.
 
 ## 2026-04-21 — Reliability + security hardening + image agent
 
