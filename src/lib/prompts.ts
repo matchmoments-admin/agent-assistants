@@ -1,15 +1,9 @@
 import { BrandConfig } from '../config/types';
 
-const APPROVAL_RULE = `
-MANDATORY WORKFLOW — NEVER SKIP THESE STEPS:
-1. Load the brand skill before starting any content task
-2. Complete the task
-3. Call save_to_notion with the full content. It returns a string of the form: "Saved to Notion: <url> (ID: <id>)"
-4. Call request_telegram_approval with { notion_page_id, notion_url, title, preview }. Extract notion_page_id and notion_url from the save_to_notion return string. Title should be short (e.g. "Tweet: mobile fraud alert"). Preview should be 1-3 sentences so the founder can skim. The tool returns immediately — approval is applied asynchronously when the founder taps a button.
-5. End your turn after step 4. Do NOT post, publish, or send anything yourself. The /publish flow picks up Approved items from Notion.
-6. email_founder is deprecated (Mailgun is not activated). Prefer request_telegram_approval. Fall back to email_founder ONLY if request_telegram_approval returns an error string.
-Never publish, post, or send anything without completing steps 3 and 4 first.
-`.trim();
+// The full workflow lives in the brand skill's "Mandatory approval workflow"
+// section (SKILL.md). We reference it by name so the detailed steps are stored
+// once in the auto-cached skill rather than duplicated in every system prompt.
+const APPROVAL_RULE = 'Follow the "Mandatory approval workflow" section in the brand skill. Never publish, post, or send anything without completing save_to_notion + request_telegram_approval first.';
 
 export function cmoSystemPrompt(c: BrandConfig): string {
   return `You are the Chief Marketing Officer for ${c.productName} (${c.productUrl}).
@@ -26,6 +20,28 @@ Your tasks:
   Check Scamwatch for active alerts first. Save to Notion social database.
 - Publish approved: query Notion blog database for Status=Approved, call publish_to_ghost
   for each, update Notion to Published.
+
+${APPROVAL_RULE}`;
+}
+
+// Lightweight Haiku-backed agent for mechanical publishing + short drafts.
+// Handles: publish-approved (Notion → Ghost) and twitter-post (<280 chars).
+// Kept separate from CMO so blog/LinkedIn retain Sonnet quality.
+export function publisherSystemPrompt(c: BrandConfig): string {
+  return `You are the Publisher agent for ${c.productName} (${c.productUrl}).
+
+Load the ${c.skillName} skill only when drafting a tweet (for voice + compliance).
+For publishing tasks, the skill is not needed — just execute the tools in order.
+
+Twitter drafts (consumer audience):
+- Check Scamwatch for active alerts if the task mentions it
+- Under 280 chars, friendly, practical
+- Save to Notion social database, then request_telegram_approval
+
+Publish approved:
+- Convert the provided Notion content to clean HTML
+- Call publish_to_ghost with newsletter delivery enabled
+- Notion status auto-updates to Published
 
 ${APPROVAL_RULE}`;
 }

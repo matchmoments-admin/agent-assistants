@@ -19,9 +19,13 @@ interface PendingToolCall {
   input: Record<string, unknown>;
 }
 
-const MAX_TURNS = 30;
+const MAX_TURNS = 12;
 const MAX_STREAM_RETRIES = 3;
 const SESSION_TIMEOUT_MS = 10 * 60 * 1000;
+// Cap tool results fed back to the model. Each turn re-submits conversation
+// history, so large results (e.g. gh_read_file) compound across the session.
+// Raw result still flows to local logs; the model sees the truncated form.
+const MAX_TOOL_RESULT_CHARS = 2000;
 
 function isNetworkDrop(err: unknown): boolean {
   const msg = String(err ?? '');
@@ -196,7 +200,13 @@ async function runSessionLoop(
       }
       for (const tool of pendingTools) {
         const result = await executeCustomTool(env, config, tool.name, tool.input);
-        queuedToolResults.push({ toolId: tool.id, result });
+        const trimmed = result.length > MAX_TOOL_RESULT_CHARS
+          ? result.slice(0, MAX_TOOL_RESULT_CHARS) + `\n…[truncated ${result.length - MAX_TOOL_RESULT_CHARS} chars]`
+          : result;
+        if (trimmed !== result) {
+          console.log(`[${agentName}] tool.result.truncated name=${tool.name} raw=${result.length}`);
+        }
+        queuedToolResults.push({ toolId: tool.id, result: trimmed });
       }
     } else {
       done = true;

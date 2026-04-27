@@ -1,7 +1,7 @@
 import type { Env } from './lib/claude';
 import { ensureEnvironment, createAgent, updateAgent, kv } from './lib/claude';
 import { loadBrandConfig } from './config/loader';
-import { cmoSystemPrompt, cpoSystemPrompt, growthSystemPrompt, irSystemPrompt, codeSystemPrompt } from './lib/prompts';
+import { cmoSystemPrompt, cpoSystemPrompt, growthSystemPrompt, irSystemPrompt, codeSystemPrompt, publisherSystemPrompt } from './lib/prompts';
 import { CONTENT_TOOLS, CODE_TOOLS } from './lib/agent-tools';
 import { uploadSkill, getSkillFiles } from './lib/skills';
 
@@ -22,12 +22,15 @@ export async function bootstrap(env: Env): Promise<BootstrapResult> {
   const skillId = await uploadSkill(env, config.skillName, skillFiles);
 
   // Create agents (or retrieve cached IDs)
+  const SONNET = 'claude-sonnet-4-6';
+  const HAIKU = 'claude-haiku-4-5-20251001';
   const agentDefs = [
-    { name: 'cmo', prompt: cmoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
-    { name: 'cpo', prompt: cpoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
-    { name: 'growth', prompt: growthSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
-    { name: 'ir', prompt: irSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
-    { name: 'code', prompt: codeSystemPrompt(config, env.GH_REPO), tools: CODE_TOOLS, skills: [] as string[] },
+    { name: 'cmo', prompt: cmoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: SONNET },
+    { name: 'publisher', prompt: publisherSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: HAIKU },
+    { name: 'cpo', prompt: cpoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: SONNET },
+    { name: 'growth', prompt: growthSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: SONNET },
+    { name: 'ir', prompt: irSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: SONNET },
+    { name: 'code', prompt: codeSystemPrompt(config, env.GH_REPO), tools: CODE_TOOLS, skills: [] as string[], model: SONNET },
   ];
 
   const agents: Record<string, string> = {};
@@ -45,6 +48,8 @@ export async function bootstrap(env: Env): Promise<BootstrapResult> {
       def.prompt,
       def.tools,
       def.skills,
+      [],
+      def.model,
     );
     await kv.put(env, `agent_${def.name}`, agentId);
     agents[def.name] = agentId;
@@ -60,12 +65,15 @@ export async function updateAllAgents(env: Env): Promise<{ updated: string[]; mi
   const skillId = await kv.get(env, `skill_id:${config.skillName}`);
   if (!skillId) throw new Error('Skill not bootstrapped. Run /setup first.');
 
+  const SONNET = 'claude-sonnet-4-6';
+  const HAIKU = 'claude-haiku-4-5-20251001';
   const agentDefs = [
-    { name: 'cmo', prompt: cmoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
-    { name: 'cpo', prompt: cpoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
-    { name: 'growth', prompt: growthSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
-    { name: 'ir', prompt: irSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId] },
-    { name: 'code', prompt: codeSystemPrompt(config, env.GH_REPO), tools: CODE_TOOLS, skills: [] as string[] },
+    { name: 'cmo', prompt: cmoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: SONNET },
+    { name: 'publisher', prompt: publisherSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: HAIKU },
+    { name: 'cpo', prompt: cpoSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: SONNET },
+    { name: 'growth', prompt: growthSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: SONNET },
+    { name: 'ir', prompt: irSystemPrompt(config), tools: CONTENT_TOOLS, skills: [skillId], model: SONNET },
+    { name: 'code', prompt: codeSystemPrompt(config, env.GH_REPO), tools: CODE_TOOLS, skills: [] as string[], model: SONNET },
   ];
 
   const updated: string[] = [];
@@ -77,7 +85,7 @@ export async function updateAllAgents(env: Env): Promise<{ updated: string[]; mi
       missing.push(def.name);
       continue;
     }
-    await updateAgent(env, cachedId, def.name, def.prompt, def.tools, def.skills);
+    await updateAgent(env, cachedId, def.name, def.prompt, def.tools, def.skills, [], def.model);
     updated.push(def.name);
   }
 

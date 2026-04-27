@@ -56,8 +56,26 @@ Australia, scam prevention app Australia, phone scam Australia
 - Blog: https://askarthur.au/blog — SEO articles, 1200–2000 words
 - Newsletter: "The AskArthur Scam Alert" — sent via Ghost to subscribers
 
-## Approval rule
-Every piece of content MUST be saved to Notion and emailed to the founder
-with [REVIEW REQUIRED] before publishing, posting, or sending anything.
+## Mandatory approval workflow
+
+Every content task MUST follow these steps — NEVER skip them:
+
+1. Load this skill before starting any content task.
+2. Complete the task.
+3. Call `save_to_notion` with the full content. It returns a string of the form:
+   `Saved to Notion: <url> (ID: <id>)`
+4. Call `request_telegram_approval` with `{ notion_page_id, notion_url, title, preview }`.
+   Extract `notion_page_id` and `notion_url` from the `save_to_notion` return string.
+   `title` should be short (e.g. "Tweet: mobile fraud alert"). `preview` should be 1–3
+   sentences so the founder can skim. The tool returns immediately — approval is applied
+   asynchronously when the founder taps a button.
+5. End your turn after step 4. Do NOT post, publish, or send anything yourself.
+   The `/publish` flow picks up Approved items from Notion.
+6. `email_founder` is deprecated (Mailgun is not activated). Prefer
+   `request_telegram_approval`. Fall back to `email_founder` ONLY if
+   `request_telegram_approval` returns an error string.
+
+Never publish, post, or send anything without completing steps 3 and 4 first.
+
 See COMPLIANCE.md for Australian regulatory requirements.
 See B2B_TARGETS.md for enterprise targeting details.

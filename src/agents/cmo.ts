@@ -18,11 +18,11 @@ export async function runCMOAgent(
       break;
 
     case 'twitter-post':
-      await runAgentSession(env, config, 'cmo', `Twitter Post — ${config.productName}`,
+      await runAgentSession(env, config, 'publisher', `Twitter Post — ${config.productName}`,
         `Draft a tweet for ${config.twitterHandle}. ` +
         `Check Scamwatch (scamwatch.gov.au) for any active scam alerts. ` +
         `Write a concise, helpful tweet (max 280 chars) with a practical tip or warning. ` +
-        `Save to the social database in Notion, then email the founder for approval.`);
+        `Save to the social database in Notion, then request_telegram_approval.`);
       break;
 
     case 'linkedin-post':
@@ -50,7 +50,7 @@ async function publishApprovedPosts(env: Env, config: BrandConfig): Promise<void
   }
 
   for (const post of approved) {
-    await runAgentSession(env, config, 'cmo', `Publish: ${post.title}`,
+    await runAgentSession(env, config, 'publisher', `Publish: ${post.title}`,
       `There is an approved blog post in Notion (page ID: ${post.id}, title: "${post.title}"). ` +
       `Fetch the full content from Notion, convert it to clean HTML, then publish it to Ghost ` +
       `using the publish_to_ghost tool. Enable newsletter delivery so subscribers are emailed. ` +
