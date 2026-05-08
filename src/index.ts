@@ -9,6 +9,7 @@ import { runGrowthAgent } from './agents/growth';
 import { runIRAgent } from './agents/investor-relations';
 import { runCodeAgent } from './agents/code';
 import { handleTelegramWebhook, sendTelegram } from './lib/telegram';
+import { handlePushBlog } from './lib/push-blog';
 
 export { AgentMemory };
 
@@ -159,6 +160,11 @@ export default {
     if (url.pathname === '/telegram' && request.method === 'POST') {
       const config = loadBrandConfig(env);
       return handleTelegramWebhook(request, env, config, ctx);
+    }
+
+    if (url.pathname === '/push-blog' && request.method === 'POST') {
+      const config = loadBrandConfig(env);
+      return handlePushBlog(request, env, config);
     }
 
     if (url.pathname === '/status') {

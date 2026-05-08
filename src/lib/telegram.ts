@@ -6,6 +6,7 @@ import { runCPOAgent } from '../agents/cpo';
 import { runGrowthAgent } from '../agents/growth';
 import { runIRAgent } from '../agents/investor-relations';
 import { runCodeAgent } from '../agents/code';
+import { publishGhostDraft } from './push-blog';
 
 interface TelegramUpdate {
   update_id: number;
@@ -297,7 +298,7 @@ async function handleCallbackQuery(
 
   // Approval flow has its own KV prefix, 7d TTL, and updates Notion directly.
   if (action === 'approve_ok' || action === 'approve_no') {
-    return handleApprovalCallback(query, env, action, nonce, chatId, messageId);
+    return handleApprovalCallback(query, env, config, action, nonce, chatId, messageId);
   }
 
   // Illustration flow: local Claude Code subagent polls the status KV.
@@ -511,6 +512,7 @@ async function editMessage(env: Env, chatId: number, messageId: number, text: st
 async function handleApprovalCallback(
   query: NonNullable<TelegramUpdate['callback_query']>,
   env: Env,
+  config: BrandConfig,
   action: string,
   nonce: string,
   chatId: number,
@@ -523,12 +525,61 @@ async function handleApprovalCallback(
     await editMessage(env, chatId, messageId, '\u23F1 Approval expired.');
     return new Response('OK', { status: 200 });
   }
-  const data = JSON.parse(raw) as { notion_page_id: string; status: string; title: string; created_at: number };
+  // The KV payload has a base shape (always present) plus push-blog-only
+  // fields written by handlePushBlog. The base shape is what every other
+  // approval source writes today.
+  const data = JSON.parse(raw) as {
+    notion_page_id: string;
+    status: string;
+    title: string;
+    created_at: number;
+    kind?: string;
+    ghost_post_id?: string;
+    ghost_preview_url?: string;
+    send_newsletter?: boolean;
+    slug?: string;
+  };
 
   const approving = action === 'approve_ok';
-  const newStatus = approving ? 'Approved' : 'Rejected';
+
+  // Push-blog approvals do extra work on the Approve path: take the Ghost
+  // draft \u2192 published, send the newsletter, then write Status=Published
+  // + Published URL to Notion. Reject leaves Ghost as draft for manual cleanup.
+  let pushBlogPublishedUrl: string | undefined;
+  let pushBlogError: string | undefined;
+  if (data.kind === 'push-blog' && approving && data.ghost_post_id) {
+    const result = await publishGhostDraft(
+      config,
+      data.ghost_post_id,
+      data.send_newsletter !== false,
+    );
+    if ('error' in result) {
+      pushBlogError = result.error;
+    } else {
+      pushBlogPublishedUrl = result.canonical_url;
+    }
+  }
+
+  // Notion status: Published if push-blog publish succeeded, else
+  // Approved/Rejected per the action. A push-blog publish failure leaves the
+  // status at Draft so the operator can retry; failure surfaces in Telegram.
+  const newStatus = pushBlogError
+    ? 'Draft'
+    : data.kind === 'push-blog' && approving
+      ? 'Published'
+      : approving
+        ? 'Approved'
+        : 'Rejected';
 
   // Update Notion page Status (if the DB has that column — tolerate failure).
+  // Include Published URL on the push-blog success path so the canonical
+  // askarthur.au link lands in the Notion row.
+  const notionProps: Record<string, unknown> = {
+    Status: { select: { name: newStatus } },
+  };
+  if (pushBlogPublishedUrl) {
+    notionProps['Published URL'] = { url: pushBlogPublishedUrl };
+  }
   const notionRes = await fetch(`https://api.notion.com/v1/pages/${data.notion_page_id}`, {
     method: 'PATCH',
     headers: {
@@ -536,9 +587,7 @@ async function handleApprovalCallback(
       'Content-Type': 'application/json',
       'Notion-Version': '2022-06-28',
     },
-    body: JSON.stringify({
-      properties: { Status: { select: { name: newStatus } } },
-    }),
+    body: JSON.stringify({ properties: notionProps }),
   });
   const notionOk = notionRes.ok;
   const notionError = notionOk ? '' : ` (Notion update failed: ${(await notionRes.text()).slice(0, 200)})`;
@@ -549,12 +598,23 @@ async function handleApprovalCallback(
     status: newStatus.toLowerCase(),
     decided_by: query.from.id,
     decided_at: Date.now(),
+    push_blog_published_url: pushBlogPublishedUrl,
+    push_blog_error: pushBlogError,
   }), { expirationTtl: 7 * 24 * 60 * 60 });
 
-  const icon = approving ? '\u2705' : '\u274C';
-  await answerCallback(env, query.id, approving ? 'Approved' : 'Rejected');
+  const icon = pushBlogError ? '\u26A0\uFE0F' : approving ? '\u2705' : '\u274C';
+  await answerCallback(
+    env,
+    query.id,
+    pushBlogError ? 'Publish failed' : approving ? 'Approved' : 'Rejected',
+  );
+  const tail = pushBlogError
+    ? ` \u2014 Ghost publish failed: ${escapeHtml(pushBlogError)}`
+    : pushBlogPublishedUrl
+      ? ` \u2014 Published: <a href="${pushBlogPublishedUrl}">${escapeHtml(pushBlogPublishedUrl)}</a>`
+      : ` \u2014 ${newStatus} by user ${query.from.id}`;
   await editMessage(env, chatId, messageId,
-    `${icon} <b>${escapeHtml(data.title)}</b> \u2014 ${newStatus} by user ${query.from.id}${notionError}`);
+    `${icon} <b>${escapeHtml(data.title)}</b>${tail}${notionError}`);
   return new Response('OK', { status: 200 });
 }
 
