@@ -10,14 +10,15 @@ export async function runGrowthAgent(
   switch (task) {
     case 'competitor-scan':
       await runAgentSession(env, config, 'growth', `Competitor Scan — ${config.productName}`,
-        `Perform the daily competitor scan for ${config.productName}. ` +
+        `Run the competitor scan for ${config.productName}. ` +
         `Check each competitor site for changes:\n` +
         config.competitors.map(c => `- ${c}`).join('\n') + '\n\n' +
-        `For each, note: new content, feature changes, pricing changes, ` +
-        `new partnerships or announcements. Compare against previous scan data ` +
-        `in your memory. Rate significance: Low/Medium/High. ` +
-        `Save summary to the competitor database in Notion. ` +
-        `Only email the founder if something is rated High significance.`);
+        `Compare against previous scan data in your memory. Save the result to ` +
+        `the competitor database in Notion using the exact document template in ` +
+        `your system prompt — including the "Feature suggestions" section ` +
+        `(Additions / Updates / Retirements) at the bottom, with each suggestion ` +
+        `tied to a specific signal from "Changes observed". ` +
+        `Only email the founder if overall significance is High.`);
       break;
   }
 }

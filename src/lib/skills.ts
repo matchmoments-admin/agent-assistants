@@ -1,7 +1,5 @@
 import type { Env } from './claude';
-import { kv } from './claude';
-
-const BASE = 'https://api.anthropic.com';
+import { kv, anthropicBaseUrl } from './claude';
 
 export interface SkillFile {
   filename: string;
@@ -21,7 +19,7 @@ export async function uploadSkill(
     formData.append('files[]', new Blob([file.content], { type: 'text/markdown' }), file.filename);
   }
 
-  const res = await fetch(`${BASE}/v1/skills`, {
+  const res = await fetch(`${anthropicBaseUrl(env)}/v1/skills`, {
     method: 'POST',
     headers: {
       'x-api-key': env.ANTHROPIC_API_KEY,

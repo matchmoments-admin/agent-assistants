@@ -14,9 +14,17 @@ id = "b795557a60614036bc21b9997b3598aa"
 name = "AGENT_MEMORY"
 class_name = "AgentMemory"
 
+[[durable_objects.bindings]]
+name = "BUDGET"
+class_name = "BudgetDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AgentMemory"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["BudgetDO"]
 
 [[vectorize]]
 binding = "AGENT_VECTORS"
@@ -32,12 +40,22 @@ max_batch_size = 1
 max_batch_timeout = 5
 max_retries = 2
 
+[[workflows]]
+name = "deploy"
+binding = "DEPLOY_WORKFLOW"
+class_name = "DeployWorkflow"
+
+[[workflows]]
+name = "rollback"
+binding = "ROLLBACK_WORKFLOW"
+class_name = "RollbackWorkflow"
+
 [triggers]
 crons = [
   "0 21 * * SUN",      # Blog draft: Sunday 7am AEST
   "0 0 * * MON",       # Weekly product digest: Monday 10am AEST
   "0 1 * * TUE",       # LinkedIn post: Tuesday 11am AEST
-  "0 0 * * *",         # Daily competitor scan + publish approved posts
+  "0 0 * * MON,WED,FRI", # Competitor scan + publish approved posts: Mon/Wed/Fri 10am AEST
   "0 22 1 * *"         # Monthly investor update: 1st of month 8am AEST
 ]
 

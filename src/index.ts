@@ -1,4 +1,6 @@
 import { AgentMemory } from './memory';
+import { BudgetDO } from './budget';
+import { DeployWorkflow, RollbackWorkflow } from './workflows/deploy';
 import type { Env, AgentTaskMessage } from './lib/claude';
 import { loadBrandConfig } from './config/loader';
 import { checkBudgetOrAbort } from './lib/cost-control';
@@ -11,7 +13,7 @@ import { runCodeAgent } from './agents/code';
 import { handleTelegramWebhook, sendTelegram } from './lib/telegram';
 import { handlePushBlog } from './lib/push-blog';
 
-export { AgentMemory };
+export { AgentMemory, BudgetDO, DeployWorkflow, RollbackWorkflow };
 
 export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
@@ -31,7 +33,7 @@ export default {
           case '0 1 * * TUE':
             await runCMOAgent(env, config, 'linkedin-post');
             break;
-          case '0 0 * * *':
+          case '0 0 * * MON,WED,FRI':
             await runGrowthAgent(env, config, 'competitor-scan');
             await runCMOAgent(env, config, 'publish-approved');
             break;
@@ -188,7 +190,23 @@ export default {
     for (const msg of batch.messages) {
       const m = msg.body;
       const label = m.kind === 'agent-command' ? `${m.agent}/${m.task}` : m.kind;
-      console.log(`queue.start kind=${m.kind} label=${label} chat=${m.chatId}`);
+      const idemKey = m.idempotencyKey
+        ? `${env.PRODUCT_ID}:idem:${m.idempotencyKey}`
+        : null;
+      console.log(`queue.start kind=${m.kind} label=${label} chat=${m.chatId} idem=${m.idempotencyKey ?? 'n/a'}`);
+
+      // Idempotency short-circuit: if the same Telegram message has already
+      // produced a successful run (queue retry, double-tap, etc.), don't
+      // re-execute. The Telegram producer derives the key deterministically.
+      if (idemKey) {
+        const prior = await env.AGENT_CONFIG.get(idemKey);
+        if (prior) {
+          console.log(`queue.dedup label=${label} prior=${prior.slice(0, 80)}`);
+          msg.ack();
+          continue;
+        }
+      }
+
       try {
         await checkBudgetOrAbort(env, config);
         if (m.kind === 'agent-command' && m.agent && m.task) {
@@ -202,6 +220,13 @@ export default {
         } else if (m.kind === 'feature' && m.description) {
           await runCodeAgent(env, config, m.description);
           // Code agent calls notify_founder itself with the PR URL
+        }
+        if (idemKey) {
+          await env.AGENT_CONFIG.put(
+            idemKey,
+            JSON.stringify({ kind: m.kind, label, completedAt: Date.now() }),
+            { expirationTtl: 90 * 24 * 60 * 60 }, // 90d, matches tg_update: convention
+          );
         }
         console.log(`queue.done label=${label}`);
         msg.ack();

@@ -114,7 +114,7 @@ Five crons (Workers Free plan limit):
 | `0 21 * * SUN` | CMO | blog-draft | Sun 7am |
 | `0 0 * * MON` | CPO | weekly-digest | Mon 10am |
 | `0 1 * * TUE` | CMO | linkedin-post | Tue 11am |
-| `0 0 * * *` | Growth + CMO | competitor-scan + publish-approved | Daily 10am |
+| `0 0 * * MON,WED,FRI` | Growth + CMO | competitor-scan + publish-approved | Mon/Wed/Fri 10am |
 | `0 22 1 * *` | IR | investor-update | 1st of month 8am |
 
 ## KV key conventions

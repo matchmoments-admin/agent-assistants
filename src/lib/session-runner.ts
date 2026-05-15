@@ -4,8 +4,7 @@ import {
   startSession,
   sendPrompt,
   sendToolResult,
-  openStream,
-  readStreamEvents,
+  streamSessionEvents,
   archiveSession,
   listSessionEvents,
 } from './claude';
@@ -31,6 +30,11 @@ function isNetworkDrop(err: unknown): boolean {
   const msg = String(err ?? '');
   return /network connection lost|connection reset|stream closed|fetch failed|socket hang up/i.test(msg);
 }
+
+// session.status_idle is terminal for each turn — break out of the SSE
+// for-await immediately rather than waiting for the server's ~2-minute
+// idle timeout.
+const breakOnIdle = (event: SSEEvent): boolean => event.type === 'session.status_idle';
 
 export async function runAgentSession(
   env: Env,
@@ -67,7 +71,7 @@ export async function runAgentSession(
         );
       }),
     ]);
-    await trackCostFromSession(env, sessionId);
+    await trackCostFromSession(env, sessionId, agentId);
     console.log(`[${agentName}] session.done id=${sessionId}`);
   } catch (err) {
     console.error(`[${agentName}] session.fail id=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
@@ -107,16 +111,17 @@ async function runSessionLoop(
     let stopReasonType = '';
 
     const handleEvent = async (event: SSEEvent) => {
-      if (typeof event.id === 'string') {
-        if (seenEventIds.has(event.id)) return;
-        seenEventIds.add(event.id);
+      const eventId = (event as { id?: string }).id;
+      if (typeof eventId === 'string') {
+        if (seenEventIds.has(eventId)) return;
+        seenEventIds.add(eventId);
       }
       switch (event.type) {
         case 'agent.custom_tool_use': {
           console.log(`[${agentName}] tool.call name=${event.name} id=${event.id}`);
           pendingTools.push({
-            id: event.id as string,
-            name: event.name as string,
+            id: event.id,
+            name: event.name,
             input: event.input as Record<string, unknown>,
           });
           break;
@@ -124,16 +129,16 @@ async function runSessionLoop(
         case 'agent.tool_use':
         case 'agent.mcp_tool_use':
         case 'agent.tool_result': {
-          const name = (event.name as string | undefined) ?? (event.tool_use?.name as string | undefined) ?? '?';
+          const name = (event as { name?: string }).name ?? '?';
           console.log(`[${agentName}] ${event.type} ${name}`);
           break;
         }
         case 'session.error': {
-          const payload = JSON.stringify(event.error ?? event);
+          const payload = JSON.stringify(event);
           throw new Error(`Session ${sessionId} session.error: ${payload.slice(0, 500)}`);
         }
         case 'session.status_idle': {
-          stopReasonType = event.stop_reason?.type as string ?? 'end_turn';
+          stopReasonType = event.stop_reason?.type ?? 'end_turn';
           console.log(`[${agentName}] idle turn=${turns} stop_reason=${stopReasonType}`);
           break;
         }
@@ -148,27 +153,28 @@ async function runSessionLoop(
     };
 
     // Open the SSE stream BEFORE sending any input.
-    // Retry on Cloudflare network drops — the server keeps the session state;
-    // we dedupe events by id and catch up via listSessionEvents on each retry.
+    // Retry on network drops — the server keeps the session state; we dedupe
+    // events by id and catch up via listSessionEvents on each retry.
     let streamAttempts = 0;
     let streamDone = false;
     while (!streamDone) {
       streamAttempts++;
       console.log(`[${agentName}] stream.open turn=${turns} attempt=${streamAttempts}`);
       try {
-        const reader = await openStream(env, sessionId);
-
         if (streamAttempts === 1) {
-          if (firstTurn) {
-            await sendPrompt(env, sessionId, prompt);
-            firstTurn = false;
-          } else {
-            for (const { toolId, result } of queuedToolResults) {
-              console.log(`[${agentName}] tool.result id=${toolId}`);
-              await sendToolResult(env, sessionId, toolId, result);
+          await streamSessionEvents(env, sessionId, async () => {
+            // Stream is established; safe to send input.
+            if (firstTurn) {
+              await sendPrompt(env, sessionId, prompt);
+              firstTurn = false;
+            } else {
+              for (const { toolId, result } of queuedToolResults) {
+                console.log(`[${agentName}] tool.result id=${toolId}`);
+                await sendToolResult(env, sessionId, toolId, result);
+              }
+              queuedToolResults = [];
             }
-            queuedToolResults = [];
-          }
+          }, handleEvent, breakOnIdle);
         } else {
           // Reconnect path — catch up any events we missed while disconnected
           console.log(`[${agentName}] stream.catchup listing events since drop`);
@@ -177,10 +183,10 @@ async function runSessionLoop(
             await handleEvent(ev);
             if (stopReasonType) break;
           }
-          if (stopReasonType) { streamDone = true; break; }
+          if (!stopReasonType) {
+            await streamSessionEvents(env, sessionId, async () => { /* no-op on reconnect */ }, handleEvent, breakOnIdle);
+          }
         }
-
-        await readStreamEvents(reader, handleEvent);
         streamDone = true;
       } catch (err) {
         if (isNetworkDrop(err) && streamAttempts < MAX_STREAM_RETRIES) {

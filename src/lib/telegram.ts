@@ -1,4 +1,5 @@
 import type { Env } from './claude';
+import { computeIdempotencyKey } from './claude';
 import type { BrandConfig } from '../config/types';
 import { checkBudgetOrAbort } from './cost-control';
 import { runCMOAgent } from '../agents/cmo';
@@ -11,6 +12,7 @@ import { publishGhostDraft } from './push-blog';
 interface TelegramUpdate {
   update_id: number;
   message?: {
+    message_id: number;
     chat: { id: number };
     from?: { id: number };
     text?: string;
@@ -261,12 +263,16 @@ export async function handleTelegramWebhook(
     await sendTelegram(env, message.chat.id, `Running ${cmd.agent}/${cmd.task}...`);
     // Queue the agent run so it executes in a separate invocation untied to
     // Telegram's 60s webhook timeout. Queue consumer in index.ts picks it up.
+    const idempotencyKey = await computeIdempotencyKey(
+      message.chat.id, message.message_id, command,
+    );
     await env.AGENT_TASKS.send({
       kind: 'agent-command',
       chatId: message.chat.id,
       userId: message.from.id,
       agent: cmd.agent as 'cmo' | 'cpo' | 'growth' | 'ir',
       task: cmd.task,
+      idempotencyKey,
     });
     return new Response('OK', { status: 200 });
   }
@@ -299,6 +305,28 @@ async function handleCallbackQuery(
   // Approval flow has its own KV prefix, 7d TTL, and updates Notion directly.
   if (action === 'approve_ok' || action === 'approve_no') {
     return handleApprovalCallback(query, env, config, action, nonce, chatId, messageId);
+  }
+
+  // Tool-confirmation flow: a gated agent tool wrote a `confirm:{nonce}` KV
+  // record and is polling for status. Flip it to approved/rejected here.
+  if (action === 'tool_ok' || action === 'tool_no') {
+    const key = `confirm:${nonce}`;
+    const raw = await env.AGENT_CONFIG.get(key);
+    if (!raw) {
+      await answerCallback(env, query.id, 'Expired.');
+      return new Response('OK', { status: 200 });
+    }
+    const data = JSON.parse(raw) as { tool: string; status: string; createdAt: number };
+    const decision = action === 'tool_ok' ? 'approved' : 'rejected';
+    await env.AGENT_CONFIG.put(
+      key,
+      JSON.stringify({ ...data, status: decision, decidedAt: Date.now(), decidedBy: query.from.id }),
+      { expirationTtl: 900 },
+    );
+    const icon = decision === 'approved' ? '✅' : '❌';
+    await answerCallback(env, query.id, decision);
+    await editMessage(env, chatId, messageId, `${icon} <b>${data.tool}</b> — ${decision}`);
+    return new Response('OK', { status: 200 });
   }
 
   // Illustration flow: local Claude Code subagent polls the status KV.
@@ -351,49 +379,34 @@ async function handleCallbackQuery(
     await editMessage(env, chatId, messageId,
       `\uD83E\uDD16 Code agent working on:\n<i>${description}</i>\n\nThis may take 1-3 minutes. The agent will message you when the PR is ready.`);
 
+    // Idempotency key derived from the confirmation nonce so a queue retry
+    // of the same /feature run reuses the existing branch + PR.
+    const idempotencyKey = await computeIdempotencyKey(chatId, messageId, 'feature', nonce);
     await env.AGENT_TASKS.send({
       kind: 'feature',
       chatId,
       userId: query.from.id,
       description,
+      idempotencyKey,
     });
     return new Response('OK', { status: 200 });
   }
 
-  // Confirm deploy
+  // Confirm deploy \u2014 hand off to the DeployWorkflow so the multi-step
+  // dispatch + log + notify is checkpointed and survives Worker restarts.
   if (action === 'deploy_ok') {
     const branch = data.branch ?? 'main';
     await answerCallback(env, query.id, 'Deploying...');
-    await editMessage(env, chatId, messageId, `\uD83D\uDE80 Deploying <b>${branch}</b>...`);
-
     try {
-      const res = await fetch(
-        `https://api.github.com/repos/${env.GH_REPO}/actions/workflows/deploy.yml/dispatches`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${env.GITHUB_PAT}`,
-            'Accept': 'application/vnd.github+json',
-            'User-Agent': 'askarthur-deploy-bot',
-          },
-          body: JSON.stringify({ ref: branch, inputs: { triggered_by: 'telegram' } }),
-        },
-      );
-
-      if (res.status === 204) {
-        await editMessage(env, chatId, messageId,
-          `\u2705 Deploy triggered: <b>${branch}</b>\nCheck GitHub Actions for progress.`);
-        await logDeploy(env, { action: 'deploy', branch, result: 'triggered' });
-      } else {
-        const errBody = await res.text();
-        await editMessage(env, chatId, messageId,
-          `\u274C Deploy failed (${res.status}): ${errBody.slice(0, 200)}`);
-        await logDeploy(env, { action: 'deploy', branch, result: `error:${res.status}` });
-      }
+      const instance = await env.DEPLOY_WORKFLOW.create({
+        params: { branch, chatId, messageId, triggeredBy: 'telegram' },
+      });
+      await editMessage(env, chatId, messageId,
+        `\uD83D\uDE80 Deploy started for <b>${branch}</b>\nWorkflow: <code>${instance.id}</code>`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Unknown error';
-      await editMessage(env, chatId, messageId, `\u274C Deploy error: ${errMsg}`);
-      await logDeploy(env, { action: 'deploy', branch, result: `exception:${errMsg}` });
+      await editMessage(env, chatId, messageId, `\u274C Deploy start failed: ${errMsg}`);
+      await logDeploy(env, { action: 'deploy', branch, result: `start-failed:${errMsg}` });
     }
     return new Response('OK', { status: 200 });
   }
@@ -401,20 +414,16 @@ async function handleCallbackQuery(
   // Confirm rollback
   if (action === 'rollback_ok') {
     await answerCallback(env, query.id, 'Rolling back...');
-    await editMessage(env, chatId, messageId, '\u23EA Rolling back...');
-
     try {
-      const res = await fetch(env.DEPLOY_HOOK_URL, { method: 'POST' });
-      if (res.ok) {
-        await editMessage(env, chatId, messageId, '\u2705 Rollback triggered.');
-        await logDeploy(env, { action: 'rollback', result: 'triggered' });
-      } else {
-        await editMessage(env, chatId, messageId, `\u274C Rollback failed (${res.status}).`);
-        await logDeploy(env, { action: 'rollback', result: `error:${res.status}` });
-      }
+      const instance = await env.ROLLBACK_WORKFLOW.create({
+        params: { chatId, messageId },
+      });
+      await editMessage(env, chatId, messageId,
+        `\u23EA Rollback started\nWorkflow: <code>${instance.id}</code>`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Unknown error';
-      await editMessage(env, chatId, messageId, `\u274C Rollback error: ${errMsg}`);
+      await editMessage(env, chatId, messageId, `\u274C Rollback start failed: ${errMsg}`);
+      await logDeploy(env, { action: 'rollback', result: `start-failed:${errMsg}` });
     }
     return new Response('OK', { status: 200 });
   }

@@ -15,6 +15,7 @@
     "wrangler": "^4.81.1"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.90.0",
     "oauth-1.0a": "^2.2.6"
   }
 }

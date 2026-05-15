@@ -128,6 +128,16 @@ export async function createBranch(env: Env, branchName: string, fromBranch = 'm
     headers: { ...(await ghHeaders(env)), 'Content-Type': 'application/json' },
     body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha: sourceSha }),
   });
+  // Idempotent on collision: GitHub returns 422 with "Reference already exists"
+  // when the ref is present. Treat as success — a queue/agent retry should
+  // reuse the existing branch instead of erroring out and opening a duplicate.
+  if (createRes.status === 422) {
+    const body = await createRes.text();
+    if (body.includes('Reference already exists')) {
+      return branchName;
+    }
+    throw new Error(`createBranch failed: ${body}`);
+  }
   if (!createRes.ok) throw new Error(`createBranch failed: ${await createRes.text()}`);
   return branchName;
 }
@@ -175,6 +185,18 @@ export async function createPR(
   head: string,
   base = 'main',
 ): Promise<string> {
+  // Idempotent on retry: if a PR already exists for this head branch, return
+  // its URL instead of attempting a duplicate POST (which 422s).
+  const owner = env.GH_REPO.split('/')[0];
+  const existing = await fetch(
+    `${BASE}/repos/${env.GH_REPO}/pulls?state=open&head=${owner}:${head}`,
+    { headers: await ghHeaders(env) },
+  );
+  if (existing.ok) {
+    const prs = await existing.json() as Array<{ html_url: string; number: number }>;
+    if (prs.length > 0) return prs[0].html_url;
+  }
+
   const res = await fetch(`${BASE}/repos/${env.GH_REPO}/pulls`, {
     method: 'POST',
     headers: { ...(await ghHeaders(env)), 'Content-Type': 'application/json' },

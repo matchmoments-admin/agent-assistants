@@ -3,12 +3,79 @@ import type { BrandConfig } from '../config/types';
 import OAuth from 'oauth-1.0a';
 import * as gh from './github';
 
+// Tools that perform irreversible external writes go through requireApproval()
+// before executing. The agent makes a single tool call as before; the wrapper
+// posts a Telegram approval keyboard and polls KV for the founder's tap. The
+// approval gate is invisible to the agent — it sees a normal tool result.
+const GATED_TOOLS = new Set([
+  'publish_to_ghost',
+  'post_to_twitter',
+  'post_to_linkedin',
+  'gh_create_pr',
+  'email_founder',
+]);
+
+function summarizeForApproval(tool: string, input: Record<string, unknown>): string {
+  const text = (input.text as string) ?? (input.body as string) ?? (input.title as string) ?? '';
+  const slug = (input.slug as string) ?? (input.dbType as string) ?? (input.branch as string) ?? '';
+  const head = text ? `\n\n${text.slice(0, 280)}${text.length > 280 ? '…' : ''}` : '';
+  return `Tool: <b>${tool}</b>${slug ? ` (${slug})` : ''}${head}`;
+}
+
+async function requireApproval(
+  env: Env,
+  tool: string,
+  input: Record<string, unknown>,
+): Promise<boolean> {
+  const nonce = crypto.randomUUID();
+  const key = `confirm:${nonce}`;
+  await env.AGENT_CONFIG.put(
+    key,
+    JSON.stringify({ tool, status: 'pending', createdAt: Date.now() }),
+    { expirationTtl: 900 }, // 15 min — must complete within session watchdog
+  );
+
+  const chatId = parseInt(env.TELEGRAM_ALLOWED_IDS.split(',')[0].trim(), 10);
+  const summary = summarizeForApproval(tool, input);
+  const message = `🔒 Approval needed before <b>${tool}</b> runs.\n\n${summary}\n\nTap to allow or reject.`;
+  const keyboard = {
+    inline_keyboard: [[
+      { text: '✅ Allow', callback_data: `tool_ok:${nonce}` },
+      { text: '❌ Reject', callback_data: `tool_no:${nonce}` },
+    ]],
+  };
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'HTML', reply_markup: keyboard }),
+  });
+
+  // Poll KV every 5s for up to ~5 minutes. Session watchdog is 10 min so this
+  // leaves ~5 min for the tool itself. Falls back to "rejected" on timeout.
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 5000));
+    const raw = await env.AGENT_CONFIG.get(key);
+    if (!raw) return false; // expired
+    const record = JSON.parse(raw) as { status: string };
+    if (record.status === 'approved') return true;
+    if (record.status === 'rejected') return false;
+  }
+  return false;
+}
+
 export async function executeCustomTool(
   env: Env,
   config: BrandConfig,
   name: string,
   input: Record<string, unknown>,
 ): Promise<string> {
+  if (GATED_TOOLS.has(name)) {
+    const approved = await requireApproval(env, name, input);
+    if (!approved) {
+      return `Aborted: ${name} was not approved by the founder. Do not retry. Continue with any non-gated work or end the turn.`;
+    }
+  }
   switch (name) {
     // Content tools
     case 'save_to_notion':
@@ -146,52 +213,189 @@ async function saveToNotion(
   // Always write Name (Notion requires a title). Status/Product are optional —
   // include them only if the target DB has those columns (pass via extraProps).
   // The /publish workflow needs a Status column with values Draft/Approved.
-  const body = {
-    parent: { database_id: dbId },
-    properties: {
-      ...extraProps,
-      Name: {
-        title: [{ text: { content: input.title as string } }],
-      },
-    },
-    children: splitToBlocks(input.content as string),
+  const titleProp = {
+    Name: { title: [{ text: { content: input.title as string } }] },
   };
+  const children = markdownToBlocks(input.content as string);
 
-  const res = await fetch('https://api.notion.com/v1/pages', {
+  const sendPage = (props: Record<string, unknown>) => fetch('https://api.notion.com/v1/pages', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${env.NOTION_TOKEN}`,
       'Content-Type': 'application/json',
       'Notion-Version': '2022-06-28',
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ parent: { database_id: dbId }, properties: props, children }),
   });
+
+  let res = await sendPage({ ...extraProps, ...titleProp });
+
+  // Agents often guess columns ("Significance", "Scan Date", ...) that don't
+  // exist in the target DB. Notion rejects the whole page with a 400
+  // validation_error on body.properties.<col>. Strip extraProps and retry
+  // once with the title only — same fallback the agent would do organically,
+  // but cuts a 2-minute round-trip out of the session.
+  if (!res.ok && res.status === 400 && Object.keys(extraProps).length > 0) {
+    const errText = await res.clone().text();
+    if (/validation_error/.test(errText) && /body\.properties\./.test(errText)) {
+      console.warn(`[save_to_notion] stripping unknown properties after 400: ${Object.keys(extraProps).join(',')}`);
+      res = await sendPage(titleProp);
+    }
+  }
 
   if (!res.ok) return `Notion error: ${await res.text()}`;
   const data = await res.json() as { url: string; id: string };
   return `Saved to Notion: ${data.url} (ID: ${data.id})`;
 }
 
-function splitToBlocks(text: string): object[] {
-  // Notion blocks have a 2000 character limit per rich_text element
-  const chunks: object[] = [];
-  for (let i = 0; i < text.length; i += 2000) {
-    chunks.push({
+// Parse the agent's markdown into typed Notion blocks so headings, lists,
+// dividers, and inline bold/italic/code/links render properly. Agents emit
+// markdown directly, but Notion requires structured block objects — the
+// previous splitToBlocks dumped everything as plain paragraphs, so `#`,
+// `**bold**` and `---` showed up as literal text.
+function markdownToBlocks(text: string): object[] {
+  const lines = text.split('\n');
+  const blocks: object[] = [];
+  let paragraphBuffer: string[] = [];
+  let inCodeFence = false;
+  let codeFenceLang = '';
+  let codeFenceLines: string[] = [];
+
+  const flushParagraph = () => {
+    if (paragraphBuffer.length === 0) return;
+    blocks.push(makeBlock('paragraph', parseInline(paragraphBuffer.join('\n'))));
+    paragraphBuffer = [];
+  };
+
+  const flushCodeFence = () => {
+    blocks.push({
       object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [{
-          type: 'text',
-          text: { content: text.slice(i, i + 2000) },
-        }],
+      type: 'code',
+      code: {
+        rich_text: [{ type: 'text', text: { content: codeFenceLines.join('\n').slice(0, 2000) } }],
+        language: notionCodeLang(codeFenceLang),
       },
     });
+    codeFenceLines = [];
+    codeFenceLang = '';
+    inCodeFence = false;
+  };
+
+  for (const line of lines) {
+    if (line.trimStart().startsWith('```')) {
+      if (inCodeFence) { flushCodeFence(); continue; }
+      flushParagraph();
+      inCodeFence = true;
+      codeFenceLang = line.trim().slice(3).trim();
+      continue;
+    }
+    if (inCodeFence) { codeFenceLines.push(line); continue; }
+
+    if (line.trim() === '') { flushParagraph(); continue; }
+
+    const h3 = line.match(/^### (.+)$/);
+    const h2 = !h3 && line.match(/^## (.+)$/);
+    const h1 = !h3 && !h2 && line.match(/^# (.+)$/);
+    if (h1 || h2 || h3) {
+      flushParagraph();
+      const type = h1 ? 'heading_1' : h2 ? 'heading_2' : 'heading_3';
+      const content = (h1 || h2 || h3)![1];
+      blocks.push(makeBlock(type, parseInline(content)));
+      continue;
+    }
+
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(line.trim())) {
+      flushParagraph();
+      blocks.push({ object: 'block', type: 'divider', divider: {} });
+      continue;
+    }
+
+    const bullet = line.match(/^[-*] (.+)$/);
+    if (bullet) {
+      flushParagraph();
+      blocks.push(makeBlock('bulleted_list_item', parseInline(bullet[1])));
+      continue;
+    }
+
+    const numbered = line.match(/^\d+\. (.+)$/);
+    if (numbered) {
+      flushParagraph();
+      blocks.push(makeBlock('numbered_list_item', parseInline(numbered[1])));
+      continue;
+    }
+
+    const quote = line.match(/^> (.+)$/);
+    if (quote) {
+      flushParagraph();
+      blocks.push(makeBlock('quote', parseInline(quote[1])));
+      continue;
+    }
+
+    paragraphBuffer.push(line);
   }
-  return chunks.length > 0 ? chunks : [{
-    object: 'block',
-    type: 'paragraph',
-    paragraph: { rich_text: [{ type: 'text', text: { content: '' } }] },
-  }];
+
+  flushParagraph();
+  if (inCodeFence) flushCodeFence();
+
+  if (blocks.length === 0) {
+    return [makeBlock('paragraph', [{ type: 'text', text: { content: '' } }])];
+  }
+  return blocks;
+}
+
+function makeBlock(type: string, richText: object[]): object {
+  return { object: 'block', type, [type]: { rich_text: richText } };
+}
+
+// Convert inline markdown (**bold**, *italic*, `code`, [text](url)) into
+// Notion rich_text elements. Underscore italics are intentionally not
+// supported to avoid false positives on snake_case identifiers and URLs.
+function parseInline(text: string): object[] {
+  const out: object[] = [];
+  const pattern = /(`([^`]+)`)|(\[([^\]]+)\]\(([^)]+)\))|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  const pushPlain = (s: string) => {
+    if (!s) return;
+    for (let i = 0; i < s.length; i += 2000) {
+      out.push({ type: 'text', text: { content: s.slice(i, i + 2000) } });
+    }
+  };
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > cursor) pushPlain(text.slice(cursor, match.index));
+    if (match[1]) {
+      out.push({ type: 'text', text: { content: match[2] }, annotations: { code: true } });
+    } else if (match[3]) {
+      out.push({ type: 'text', text: { content: match[4], link: { url: match[5] } } });
+    } else if (match[6]) {
+      out.push({ type: 'text', text: { content: match[7] }, annotations: { bold: true } });
+    } else if (match[8]) {
+      out.push({ type: 'text', text: { content: match[9] }, annotations: { italic: true } });
+    }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) pushPlain(text.slice(cursor));
+  if (out.length === 0) out.push({ type: 'text', text: { content: '' } });
+  return out;
+}
+
+// Notion's `code` block language enum accepts these common values; anything
+// unrecognised falls back to 'plain text' which Notion always accepts.
+const NOTION_CODE_LANGS = new Set([
+  'bash', 'c', 'css', 'docker', 'go', 'graphql', 'html', 'java', 'javascript',
+  'json', 'markdown', 'php', 'python', 'ruby', 'rust', 'shell', 'sql',
+  'swift', 'typescript', 'yaml',
+]);
+function notionCodeLang(lang: string): string {
+  const normalised = lang.toLowerCase().trim();
+  if (normalised === 'ts') return 'typescript';
+  if (normalised === 'js') return 'javascript';
+  if (normalised === 'py') return 'python';
+  if (normalised === 'sh') return 'shell';
+  if (NOTION_CODE_LANGS.has(normalised)) return normalised;
+  return 'plain text';
 }
 
 async function updateNotionStatus(

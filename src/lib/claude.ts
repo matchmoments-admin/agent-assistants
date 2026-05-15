@@ -2,6 +2,7 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   AGENT_CONFIG: KVNamespace;
   AGENT_MEMORY: DurableObjectNamespace;
+  BUDGET: DurableObjectNamespace;
   AGENT_VECTORS: VectorizeIndex;
   PRODUCT_ID: string;
   BUDGET_LIMIT_USD: string;
@@ -34,7 +35,17 @@ export interface Env {
   DEPLOY_HOOK_URL: string;
   GH_REPO: string;
   ILLUSTRATE_SECRET?: string;
+  // Optional: full Cloudflare AI Gateway URL ending in `/anthropic`, e.g.
+  // https://gateway.ai.cloudflare.com/v1/<account>/agent-fleet/anthropic
+  // When set, both the SDK and raw-fetch paths route through it for tracing.
+  AI_GATEWAY_URL?: string;
   AGENT_TASKS: Queue<AgentTaskMessage>;
+  DEPLOY_WORKFLOW: Workflow;
+  ROLLBACK_WORKFLOW: Workflow;
+}
+
+export function anthropicBaseUrl(env: Env): string {
+  return env.AI_GATEWAY_URL ?? 'https://api.anthropic.com';
 }
 
 export interface AgentTaskMessage {
@@ -44,9 +55,23 @@ export interface AgentTaskMessage {
   agent?: 'cmo' | 'cpo' | 'growth' | 'ir';
   task?: string;
   description?: string;
+  // SHA-256 of (chatId, messageId, command). Set by the Telegram producer so a
+  // queue retry of the same message hits the dedup short-circuit in queue().
+  idempotencyKey?: string;
 }
 
-const BASE = 'https://api.anthropic.com';
+export async function computeIdempotencyKey(...parts: (string | number)[]): Promise<string> {
+  const data = new TextEncoder().encode(parts.join(''));
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+}
+
+// Module-level fallback used by helpers that already have an Env in scope —
+// they should call anthropicBaseUrl(env) instead. Bootstrap-only paths
+// (createAgent, createVault, ensureEnvironment) read this directly.
+function base(env: Env): string {
+  return anthropicBaseUrl(env);
+}
 
 // Retry transient failures (429 rate limit, 529 overloaded, 500/502/503/504 server)
 // with exponential backoff honouring the retry-after header.
@@ -91,7 +116,7 @@ export async function ensureEnvironment(env: Env): Promise<string> {
   const cached = await kv.get(env, 'environment_id');
   if (cached) return cached;
 
-  const res = await fetch(`${BASE}/v1/environments`, {
+  const res = await fetch(`${base(env)}/v1/environments`, {
     method: 'POST',
     headers: headers(env),
     body: JSON.stringify({
@@ -116,7 +141,7 @@ export async function createVault(
   const cached = await kv.get(env, `vault_${name}`);
   if (cached) return cached;
 
-  const createRes = await fetch(`${BASE}/v1/vaults`, {
+  const createRes = await fetch(`${base(env)}/v1/vaults`, {
     method: 'POST',
     headers: headers(env),
     body: JSON.stringify({ display_name: name }),
@@ -128,7 +153,7 @@ export async function createVault(
   const { id: vaultId } = await createRes.json() as { id: string };
 
   for (const [key, value] of Object.entries(secrets)) {
-    const credRes = await fetch(`${BASE}/v1/vaults/${vaultId}/credentials`, {
+    const credRes = await fetch(`${base(env)}/v1/vaults/${vaultId}/credentials`, {
       method: 'POST',
       headers: headers(env),
       body: JSON.stringify({
@@ -155,7 +180,7 @@ export async function createAgent(
   mcpServers: object[] = [],
   model = 'claude-sonnet-4-6',
 ): Promise<string> {
-  const res = await fetch(`${BASE}/v1/agents`, {
+  const res = await fetch(`${base(env)}/v1/agents`, {
     method: 'POST',
     headers: headers(env),
     body: JSON.stringify({
@@ -186,14 +211,14 @@ export async function updateAgent(
   model = 'claude-sonnet-4-6',
 ): Promise<void> {
   // Fetch the current version so we can send version+1 as the new version.
-  const getRes = await fetch(`${BASE}/v1/agents/${agentId}`, { headers: headers(env) });
+  const getRes = await fetch(`${base(env)}/v1/agents/${agentId}`, { headers: headers(env) });
   if (!getRes.ok) {
     const rid = getRes.headers.get('request-id') ?? 'unknown';
     throw new Error(`Fetch agent ${agentId} failed [req ${rid}]: ${await getRes.text()}`);
   }
   const current = await getRes.json() as { version?: number };
 
-  const res = await fetch(`${BASE}/v1/agents/${agentId}`, {
+  const res = await fetch(`${base(env)}/v1/agents/${agentId}`, {
     method: 'POST',
     headers: headers(env),
     body: JSON.stringify({
@@ -212,6 +237,50 @@ export async function updateAgent(
   }
 }
 
+// ── Session API (SDK-backed) ──────────────────────────────────────────────────
+//
+// Hot-path session calls go through @anthropic-ai/sdk's beta.sessions.* surface.
+// The SDK auto-attaches `anthropic-beta: managed-agents-2026-04-01`, accumulates
+// the SSE stream into a typed AsyncIterable, and absorbs schema drift on the
+// beta wire. Bootstrap-only paths (createAgent / updateAgent / createVault /
+// ensureEnvironment) above stay on raw fetch — they're touched once at /setup
+// and the contract test catches drift early.
+
+import Anthropic from '@anthropic-ai/sdk';
+import type {
+  BetaManagedAgentsStreamSessionEvents,
+  BetaManagedAgentsSessionEvent,
+} from '@anthropic-ai/sdk/resources/beta/sessions/events';
+
+let _client: Anthropic | undefined;
+let _clientKey: string | undefined;
+let _clientBase: string | undefined;
+function getClient(env: Env): Anthropic {
+  const baseURL = anthropicBaseUrl(env);
+  if (!_client || _clientKey !== env.ANTHROPIC_API_KEY || _clientBase !== baseURL) {
+    _client = new Anthropic({
+      apiKey: env.ANTHROPIC_API_KEY,
+      baseURL,
+      // Cloudflare AI Gateway uses cf-aig-metadata for searchable trace tags.
+      // Sending it always is safe — direct Anthropic ignores unknown headers.
+      defaultHeaders: {
+        'cf-aig-metadata': JSON.stringify({ product: env.PRODUCT_ID }),
+      },
+    });
+    _clientKey = env.ANTHROPIC_API_KEY;
+    _clientBase = baseURL;
+  }
+  return _client;
+}
+
+function annotateRequestId(prefix: string, err: unknown): Error {
+  if (err instanceof Anthropic.APIError) {
+    const rid = err.requestID ?? 'unknown';
+    return new Error(`${prefix} [req ${rid}]: ${err.message}`);
+  }
+  return err instanceof Error ? err : new Error(`${prefix}: ${String(err)}`);
+}
+
 export async function startSession(
   env: Env,
   agentId: string,
@@ -219,22 +288,17 @@ export async function startSession(
   title: string,
   vaultIds: string[] = [],
 ): Promise<string> {
-  const res = await fetchWithRetry(`${BASE}/v1/sessions`, {
-    method: 'POST',
-    headers: headers(env),
-    body: JSON.stringify({
+  try {
+    const session = await getClient(env).beta.sessions.create({
       agent: { type: 'agent', id: agentId },
       environment_id: environmentId,
       title,
       vault_ids: vaultIds,
-    }),
-  });
-  if (!res.ok) {
-    const rid = res.headers.get('request-id') ?? 'unknown';
-    throw new Error(`Start session failed [req ${rid}]: ${await res.text()}`);
+    });
+    return session.id;
+  } catch (err) {
+    throw annotateRequestId('Start session failed', err);
   }
-  const data = await res.json() as { id: string };
-  return data.id;
 }
 
 export async function sendPrompt(
@@ -242,16 +306,12 @@ export async function sendPrompt(
   sessionId: string,
   text: string,
 ): Promise<void> {
-  const res = await fetchWithRetry(`${BASE}/v1/sessions/${sessionId}/events`, {
-    method: 'POST',
-    headers: headers(env),
-    body: JSON.stringify({
+  try {
+    await getClient(env).beta.sessions.events.send(sessionId, {
       events: [{ type: 'user.message', content: [{ type: 'text', text }] }],
-    }),
-  });
-  if (!res.ok) {
-    const rid = res.headers.get('request-id') ?? 'unknown';
-    throw new Error(`Send prompt failed [req ${rid}]: ${await res.text()}`);
+    });
+  } catch (err) {
+    throw annotateRequestId('Send prompt failed', err);
   }
 }
 
@@ -261,20 +321,16 @@ export async function sendToolResult(
   toolUseId: string,
   result: string,
 ): Promise<void> {
-  const res = await fetchWithRetry(`${BASE}/v1/sessions/${sessionId}/events`, {
-    method: 'POST',
-    headers: headers(env),
-    body: JSON.stringify({
+  try {
+    await getClient(env).beta.sessions.events.send(sessionId, {
       events: [{
         type: 'user.custom_tool_result',
         custom_tool_use_id: toolUseId,
         content: [{ type: 'text', text: result }],
       }],
-    }),
-  });
-  if (!res.ok) {
-    const rid = res.headers.get('request-id') ?? 'unknown';
-    throw new Error(`Send tool result failed [req ${rid}]: ${await res.text()}`);
+    });
+  } catch (err) {
+    throw annotateRequestId('Send tool result failed', err);
   }
 }
 
@@ -283,76 +339,52 @@ export async function listSessionEvents(
   sessionId: string,
   limit: number = 100,
 ): Promise<SSEEvent[]> {
-  const res = await fetch(`${BASE}/v1/sessions/${sessionId}/events?limit=${limit}`, {
-    headers: headers(env),
-  });
-  if (!res.ok) {
-    const rid = res.headers.get('request-id') ?? 'unknown';
-    throw new Error(`List events failed [req ${rid}]: ${await res.text()}`);
+  try {
+    const events: BetaManagedAgentsSessionEvent[] = [];
+    for await (const event of getClient(env).beta.sessions.events.list(sessionId, { limit })) {
+      events.push(event);
+      if (events.length >= limit) break;
+    }
+    return events as SSEEvent[];
+  } catch (err) {
+    throw annotateRequestId('List events failed', err);
   }
-  const body = await res.json() as { events?: SSEEvent[]; data?: SSEEvent[] };
-  return body.events ?? body.data ?? [];
 }
 
 export async function archiveSession(env: Env, sessionId: string): Promise<void> {
-  await fetch(`${BASE}/v1/sessions/${sessionId}/archive`, {
-    method: 'POST',
-    headers: headers(env),
-  });
+  try {
+    await getClient(env).beta.sessions.archive(sessionId);
+  } catch {
+    // best effort — caller already in finally
+  }
 }
 
-export interface SSEEvent {
-  type: string;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  [key: string]: any;
-}
+// SSEEvent is the discriminated union the session-runner consumes. It's wider
+// than BetaManagedAgentsSessionEvent because the streaming endpoint can emit
+// span/status events that the list endpoint historically did not.
+export type SSEEvent = BetaManagedAgentsStreamSessionEvents;
 
-export async function openStream(
+export async function streamSessionEvents(
   env: Env,
   sessionId: string,
-): Promise<ReadableStreamDefaultReader<Uint8Array>> {
-  const res = await fetch(`${BASE}/v1/sessions/${sessionId}/events/stream`, {
-    headers: {
-      ...headers(env),
-      Accept: 'text/event-stream',
-    },
-  });
-  if (!res.ok) {
-    const rid = res.headers.get('request-id') ?? 'unknown';
-    throw new Error(`Stream failed [req ${rid}]: ${await res.text()}`);
-  }
-  if (!res.body) throw new Error('No response body for stream');
-  return res.body.getReader();
-}
-
-export async function readStreamEvents(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onOpen: () => Promise<void>,
   onEvent: (event: SSEEvent) => Promise<void>,
+  shouldBreak?: (event: SSEEvent) => boolean,
 ): Promise<void> {
-  const decoder = new TextDecoder();
-  let buffer = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-
-    let currentEventType = '';
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        currentEventType = line.slice(7).trim();
-      } else if (line.startsWith('data: ') && currentEventType) {
-        try {
-          const data = JSON.parse(line.slice(6));
-          await onEvent({ type: currentEventType, ...data });
-        } catch {
-          // skip malformed JSON
-        }
-        currentEventType = '';
-      }
+  try {
+    // Awaiting .stream() ensures the SSE connection is established (response
+    // headers received). Anything sent via sendPrompt/sendToolResult after
+    // onOpen() returns is guaranteed to arrive on a live subscription.
+    const stream = await getClient(env).beta.sessions.events.stream(sessionId);
+    await onOpen();
+    for await (const event of stream) {
+      await onEvent(event);
+      // The server keeps the SSE channel open after session.status_idle until
+      // its own ~2-minute timeout. Without an explicit break the runner sits
+      // idle between turns and burns the session watchdog.
+      if (shouldBreak?.(event)) break;
     }
+  } catch (err) {
+    throw annotateRequestId('Stream failed', err);
   }
 }

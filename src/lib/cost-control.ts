@@ -1,19 +1,28 @@
 import type { Env } from './claude';
-import { kv } from './claude';
+import { kv, anthropicBaseUrl } from './claude';
 import type { BrandConfig } from '../config/types';
+
+function budgetStub(env: Env) {
+  // Product-scoped so dev and prod never share the same DO instance.
+  const id = env.BUDGET.idFromName(`${env.PRODUCT_ID}-budget`);
+  return env.BUDGET.get(id) as DurableObjectStub & {
+    recordSpend(usd: number, agentId?: string, sessionId?: string): Promise<number>;
+    getMonthSpend(): Promise<number>;
+  };
+}
 
 export async function checkBudgetOrAbort(env: Env, config: BrandConfig): Promise<void> {
   const limit = parseFloat(env.BUDGET_LIMIT_USD);
+  // Reset web-search counter at month boundary (still KV — read-mostly).
   const month = new Date().toISOString().slice(0, 7);
-
   const storedMonth = await kv.get(env, 'spend_month');
   if (storedMonth !== month) {
     await kv.put(env, 'spend_month', month);
-    await kv.put(env, 'monthly_spend_usd', '0');
     await kv.put(env, 'search_count', '0');
   }
 
-  const spent = parseFloat(await kv.get(env, 'monthly_spend_usd') ?? '0');
+  // Authoritative spend read: BudgetDO. KV is a stale cache used by /status only.
+  const spent = await budgetStub(env).getMonthSpend();
 
   if (spent >= limit) {
     await sendBudgetAlert(env, config,
@@ -27,9 +36,9 @@ export async function checkBudgetOrAbort(env: Env, config: BrandConfig): Promise
   }
 }
 
-export async function trackCostFromSession(env: Env, sessionId: string): Promise<void> {
+export async function trackCostFromSession(env: Env, sessionId: string, agentId?: string): Promise<void> {
   try {
-    const res = await fetch(`https://api.anthropic.com/v1/sessions/${sessionId}`, {
+    const res = await fetch(`${anthropicBaseUrl(env)}/v1/sessions/${sessionId}`, {
       headers: {
         'x-api-key': env.ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
@@ -62,8 +71,7 @@ export async function trackCostFromSession(env: Env, sessionId: string): Promise
       (cacheRead * 0.3 / 1_000_000) +
       (output_tokens * 15 / 1_000_000);
 
-    const current = parseFloat(await kv.get(env, 'monthly_spend_usd') ?? '0');
-    await kv.put(env, 'monthly_spend_usd', (current + cost).toFixed(6));
+    await budgetStub(env).recordSpend(cost, agentId, sessionId);
   } catch {
     // non-critical — don't block agent runs
   }
