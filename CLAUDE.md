@@ -227,3 +227,14 @@ Secrets (set via `wrangler secret put`):
 8. Bootstrap via the new product's URL
 
 See STATUS.md for current deployment state and outstanding setup.
+
+## Agent skills
+
+### Issue tracker
+GitHub issues via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+The canonical five labels, used as-is. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root (created lazily by `/domain-modeling`; proceed silently while absent). See `docs/agents/domain.md`.
