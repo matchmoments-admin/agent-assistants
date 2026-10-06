@@ -237,4 +237,4 @@ GitHub issues via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 The canonical five labels, used as-is. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
-Single-context: `CONTEXT.md` + `docs/adr/` at the repo root (created lazily by `/domain-modeling`; proceed silently while absent). See `docs/agents/domain.md`.
+Single-context: `GLOSSARY.md` + `docs/adr/` at the repo root (created lazily by `/domain-modeling`; proceed silently while absent). See `docs/agents/domain.md`.
